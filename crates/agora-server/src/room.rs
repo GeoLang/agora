@@ -1,0 +1,374 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde_json::Value;
+use sqlx::{PgPool, Row};
+use tokio::sync::{Mutex, broadcast};
+use uuid::Uuid;
+
+use crate::limits::{
+    CHECKPOINT_INTERVAL_OPS, MAX_DOCUMENT_STATE_BYTES, MAX_PEERS_PER_DOCUMENT,
+    ROOM_BROADCAST_CAPACITY, oldest_op_to_keep,
+};
+use crate::protocol::{Peer, ServerMessage};
+use crate::state::{
+    DocumentState, KeyError, META_NAME_KEY, op_value_within_cap, parse_key, valid_document_name,
+};
+
+#[derive(Debug)]
+pub enum OpError {
+    Key(KeyError),
+    ValueTooLarge,
+    StateTooLarge,
+    InvalidName,
+    Database(sqlx::Error),
+}
+
+impl OpError {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            OpError::Key(error) => error.reason(),
+            OpError::ValueTooLarge => "op value too large",
+            OpError::StateTooLarge => "document state limit reached",
+            OpError::InvalidName => "invalid document name",
+            OpError::Database(_) => "database error",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum JoinError {
+    DocumentNotFound,
+    RoomFull,
+    Database(sqlx::Error),
+}
+
+struct PeerEntry {
+    connection_id: u64,
+    peer: Peer,
+}
+
+struct RoomInner {
+    state: DocumentState,
+    seq: i64,
+    ops_since_checkpoint: u64,
+    peers: Vec<PeerEntry>,
+}
+
+impl RoomInner {
+    fn peer_list(&self) -> Vec<Peer> {
+        self.peers.iter().map(|entry| entry.peer.clone()).collect()
+    }
+}
+
+/// One document held in memory while at least one connection is on it. Every
+/// op for the document passes through [`Room::apply_op`], which is what makes
+/// the server the single order authority.
+pub struct Room {
+    pub document_id: Uuid,
+    sender: broadcast::Sender<Arc<str>>,
+    inner: Mutex<RoomInner>,
+}
+
+impl Room {
+    async fn load(pool: &PgPool, document_id: Uuid) -> Result<Self, JoinError> {
+        let row = sqlx::query("select checkpoint, checkpoint_seq from documents where id = $1")
+            .bind(document_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(JoinError::Database)?
+            .ok_or(JoinError::DocumentNotFound)?;
+        let checkpoint: Value = row.try_get("checkpoint").map_err(JoinError::Database)?;
+        let checkpoint_seq: i64 = row.try_get("checkpoint_seq").map_err(JoinError::Database)?;
+
+        let mut state = DocumentState::from_checkpoint(&checkpoint);
+        let tail = sqlx::query(
+            "select seq, key, value from ops where doc_id = $1 and seq > $2 order by seq",
+        )
+        .bind(document_id)
+        .bind(checkpoint_seq)
+        .fetch_all(pool)
+        .await
+        .map_err(JoinError::Database)?;
+
+        let mut seq = checkpoint_seq;
+        for row in tail {
+            let op_seq: i64 = row.try_get("seq").map_err(JoinError::Database)?;
+            let key: String = row.try_get("key").map_err(JoinError::Database)?;
+            let value: Option<Value> = row.try_get("value").map_err(JoinError::Database)?;
+            if parse_key(&key).is_ok() {
+                state.apply(&key, value);
+            }
+            seq = op_seq;
+        }
+
+        let (sender, _) = broadcast::channel(ROOM_BROADCAST_CAPACITY);
+        Ok(Self {
+            document_id,
+            sender,
+            inner: Mutex::new(RoomInner {
+                state,
+                seq,
+                ops_since_checkpoint: 0,
+                peers: Vec::new(),
+            }),
+        })
+    }
+
+    pub async fn snapshot(&self) -> (i64, Value) {
+        let inner = self.inner.lock().await;
+        (inner.seq, inner.state.snapshot())
+    }
+
+    /// Fan a message out to every connection on the document. A connection too
+    /// far behind loses messages and is resynced with a snapshot, which is what
+    /// keeps presence from queueing up behind a slow peer.
+    pub fn relay(&self, message: &ServerMessage) {
+        let _ = self.sender.send(message.encode());
+    }
+
+    /// Validate, order, persist, apply and fan out one op. Returns the seq the
+    /// server assigned.
+    pub async fn apply_op(
+        &self,
+        pool: &PgPool,
+        actor: &str,
+        client_seq: i64,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<i64, OpError> {
+        parse_key(key).map_err(OpError::Key)?;
+        if let Some(value) = &value
+            && !op_value_within_cap(value)
+        {
+            return Err(OpError::ValueTooLarge);
+        }
+        let document_name = self.document_name_from(key, value.as_ref())?;
+
+        let mut inner = self.inner.lock().await;
+        if inner.state.projected_bytes(key, value.as_ref()) > MAX_DOCUMENT_STATE_BYTES {
+            return Err(OpError::StateTooLarge);
+        }
+        let seq = inner.seq + 1;
+
+        let mut transaction = pool.begin().await.map_err(OpError::Database)?;
+        sqlx::query(
+            "insert into ops (doc_id, seq, actor, key, value, client_seq)
+             values ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(self.document_id)
+        .bind(seq)
+        .bind(actor)
+        .bind(key)
+        .bind(&value)
+        .bind(client_seq)
+        .execute(&mut *transaction)
+        .await
+        .map_err(OpError::Database)?;
+        if let Some(name) = document_name {
+            sqlx::query("update documents set name = $1 where id = $2")
+                .bind(name)
+                .bind(self.document_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(OpError::Database)?;
+        }
+        transaction.commit().await.map_err(OpError::Database)?;
+
+        inner.state.apply(key, value.clone());
+        inner.seq = seq;
+        inner.ops_since_checkpoint += 1;
+
+        self.relay(&ServerMessage::Op {
+            seq,
+            actor: actor.to_string(),
+            key: key.to_string(),
+            value,
+        });
+
+        if inner.ops_since_checkpoint >= CHECKPOINT_INTERVAL_OPS {
+            let folded = inner.state.snapshot();
+            // a failed checkpoint is not an op failure: the op rows are already
+            // committed, so the next op retries the fold
+            if self.checkpoint(pool, folded, seq).await.is_ok() {
+                inner.ops_since_checkpoint = 0;
+            }
+        }
+        Ok(seq)
+    }
+
+    /// `meta/name` is the one key with server meaning, so it has to hold a name
+    /// the document row can carry.
+    fn document_name_from(
+        &self,
+        key: &str,
+        value: Option<&Value>,
+    ) -> Result<Option<String>, OpError> {
+        if key != META_NAME_KEY {
+            return Ok(None);
+        }
+        let Some(name) = value.and_then(Value::as_str) else {
+            return Err(OpError::InvalidName);
+        };
+        if !valid_document_name(name) {
+            return Err(OpError::InvalidName);
+        }
+        Ok(Some(name.to_string()))
+    }
+
+    async fn checkpoint(&self, pool: &PgPool, folded: Value, seq: i64) -> Result<(), sqlx::Error> {
+        let mut transaction = pool.begin().await?;
+        sqlx::query("update documents set checkpoint = $1, checkpoint_seq = $2 where id = $3")
+            .bind(folded)
+            .bind(seq)
+            .bind(self.document_id)
+            .execute(&mut *transaction)
+            .await?;
+        if let Some(oldest) = oldest_op_to_keep(seq) {
+            sqlx::query("delete from ops where doc_id = $1 and seq < $2")
+                .bind(self.document_id)
+                .bind(oldest)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await
+    }
+}
+
+/// What a connection needs after it has been admitted to a room.
+pub struct Joined {
+    pub room: Arc<Room>,
+    pub connection_id: u64,
+    pub receiver: broadcast::Receiver<Arc<str>>,
+    pub seq: i64,
+    pub state: Value,
+}
+
+/// The live rooms. A room is loaded on the first join and dropped when the last
+/// connection leaves, so an idle document costs nothing.
+pub struct RoomRegistry {
+    rooms: Mutex<HashMap<Uuid, Arc<Room>>>,
+    next_connection_id: AtomicU64,
+}
+
+impl RoomRegistry {
+    pub fn new() -> Self {
+        Self {
+            rooms: Mutex::new(HashMap::new()),
+            next_connection_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Subscribe, register the peer and capture the state under one lock, so no
+    /// op can slip between the snapshot a client gets and the stream it starts
+    /// listening to.
+    pub async fn join(
+        &self,
+        pool: &PgPool,
+        document_id: Uuid,
+        peer: Peer,
+    ) -> Result<Joined, JoinError> {
+        let mut rooms = self.rooms.lock().await;
+        let room = match rooms.get(&document_id) {
+            Some(room) => Arc::clone(room),
+            None => {
+                let room = Arc::new(Room::load(pool, document_id).await?);
+                rooms.insert(document_id, Arc::clone(&room));
+                room
+            }
+        };
+
+        let mut inner = room.inner.lock().await;
+        if inner.peers.len() >= MAX_PEERS_PER_DOCUMENT {
+            return Err(JoinError::RoomFull);
+        }
+
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let receiver = room.sender.subscribe();
+        inner.peers.push(PeerEntry {
+            connection_id,
+            peer,
+        });
+        let joined = Joined {
+            room: Arc::clone(&room),
+            connection_id,
+            receiver,
+            seq: inner.seq,
+            state: inner.state.snapshot(),
+        };
+        room.relay(&ServerMessage::Peers {
+            peers: inner.peer_list(),
+        });
+        Ok(joined)
+    }
+
+    pub async fn leave(&self, document_id: Uuid, connection_id: u64) {
+        let mut rooms = self.rooms.lock().await;
+        let Some(room) = rooms.get(&document_id).map(Arc::clone) else {
+            return;
+        };
+        let mut inner = room.inner.lock().await;
+        inner
+            .peers
+            .retain(|entry| entry.connection_id != connection_id);
+        if inner.peers.is_empty() {
+            rooms.remove(&document_id);
+            return;
+        }
+        room.relay(&ServerMessage::Peers {
+            peers: inner.peer_list(),
+        });
+    }
+
+    pub async fn is_loaded(&self, document_id: Uuid) -> bool {
+        self.rooms.lock().await.contains_key(&document_id)
+    }
+}
+
+impl Default for RoomRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The lowest op seq still stored for a document, or `None` once every op has
+/// been folded into the checkpoint and pruned.
+pub async fn oldest_retained_op(
+    pool: &PgPool,
+    document_id: Uuid,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row = sqlx::query("select min(seq) as oldest from ops where doc_id = $1")
+        .bind(document_id)
+        .fetch_one(pool)
+        .await?;
+    row.try_get::<Option<i64>, _>("oldest")
+}
+
+pub async fn ops_between(
+    pool: &PgPool,
+    document_id: Uuid,
+    after: i64,
+    through: i64,
+) -> Result<Vec<ServerMessage>, sqlx::Error> {
+    let rows = sqlx::query(
+        "select seq, actor, key, value from ops
+         where doc_id = $1 and seq > $2 and seq <= $3 order by seq",
+    )
+    .bind(document_id)
+    .bind(after)
+    .bind(through)
+    .fetch_all(pool)
+    .await?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    for row in rows {
+        messages.push(ServerMessage::Op {
+            seq: row.try_get("seq")?,
+            actor: row.try_get("actor")?,
+            key: row.try_get("key")?,
+            value: row.try_get("value")?,
+        });
+    }
+    Ok(messages)
+}
