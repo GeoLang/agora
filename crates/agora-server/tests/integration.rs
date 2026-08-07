@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use agora_server::auth::AuthConfig;
+use agora_server::auth::{AuthConfig, share_token_hash};
 use agora_server::limits::{
     MAX_CLIENT_MESSAGES_PER_SECOND, MAX_DOCUMENT_NAME_BYTES, MAX_INBOUND_FRAME_BYTES,
     MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES,
@@ -1334,6 +1334,74 @@ async fn the_http_api_only_shows_a_caller_their_own_documents() {
         .await
         .expect("list with no token");
     assert_eq!(unauthenticated.status(), 401);
+}
+
+#[tokio::test]
+async fn a_share_link_is_stored_only_as_a_hash() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "hashed at rest").await;
+    let link = mint_link(&app, &token, document_id, "edit").await;
+
+    let stored: Vec<String> =
+        sqlx::query_scalar("select token_hash from share_links where doc_id = $1")
+            .bind(document_id)
+            .fetch_all(&app.state.pool)
+            .await
+            .expect("read share_links");
+    assert_eq!(stored.len(), 1);
+    assert_ne!(stored[0], link, "the raw token is in the database");
+    assert_eq!(stored[0], share_token_hash(&link));
+
+    // a database read hands over the hash, and the hash is not a credential
+    let by_hash = app
+        .client
+        .get(format!("{}/links/{}", app.http_base, stored[0]))
+        .send()
+        .await
+        .expect("resolve by the stored hash");
+    assert_eq!(by_hash.status(), 404);
+
+    assert_eq!(resolve_link(&app, &link).await["role"], "edit");
+}
+
+#[tokio::test]
+async fn a_raw_token_still_revokes_its_link() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "revoke by raw token").await;
+    let link = mint_link(&app, &token, document_id, "view").await;
+    let session = resolve_link(&app, &link).await["sessionToken"]
+        .as_str()
+        .expect("a session token")
+        .to_string();
+
+    let revoked = app
+        .client
+        .delete(format!("{}/links/{link}", app.http_base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("revoke");
+    assert_eq!(revoked.status(), 204);
+
+    let flag: bool = sqlx::query_scalar("select revoked from share_links where token_hash = $1")
+        .bind(share_token_hash(&link))
+        .fetch_one(&app.state.pool)
+        .await
+        .expect("read the revoked flag");
+    assert!(flag, "revoking by the raw token missed the row");
+
+    let gone = app
+        .client
+        .get(format!("{}/links/{link}", app.http_base))
+        .send()
+        .await
+        .expect("resolve a revoked link");
+    assert_eq!(gone.status(), 404);
+
+    let refused = connect_with_subprotocol(&app, document_id, &session, None).await;
+    assert_eq!(handshake_status(refused), Some(403));
 }
 
 #[tokio::test]

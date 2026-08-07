@@ -6,7 +6,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{Caller, random_share_token};
+use crate::auth::{Caller, random_share_token, share_token_hash};
 use crate::documents::require_editor;
 use crate::error::ApiError;
 use crate::role::DocumentRole;
@@ -18,12 +18,15 @@ pub struct ShareLink {
     pub role: DocumentRole,
 }
 
+/// Takes the raw token every caller already holds and hashes it here, so the
+/// stored form has exactly one producer.
 pub async fn live_link(pool: &PgPool, token: &str) -> Result<Option<ShareLink>, sqlx::Error> {
-    let row =
-        sqlx::query("select doc_id, role from share_links where token = $1 and revoked = false")
-            .bind(token)
-            .fetch_optional(pool)
-            .await?;
+    let row = sqlx::query(
+        "select doc_id, role from share_links where token_hash = $1 and revoked = false",
+    )
+    .bind(share_token_hash(token))
+    .fetch_optional(pool)
+    .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -57,9 +60,9 @@ pub async fn create_link(
 
     let token = random_share_token();
     sqlx::query(
-        "insert into share_links (token, doc_id, role, created_by) values ($1, $2, $3, $4)",
+        "insert into share_links (token_hash, doc_id, role, created_by) values ($1, $2, $3, $4)",
     )
-    .bind(&token)
+    .bind(share_token_hash(&token))
     .bind(document_id)
     .bind(request.role.as_str())
     .bind(&caller.user_id)
@@ -74,8 +77,9 @@ pub async fn revoke_link(
     caller: Caller,
     Path(token): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let row = sqlx::query("select doc_id from share_links where token = $1")
-        .bind(&token)
+    let token_hash = share_token_hash(&token);
+    let row = sqlx::query("select doc_id from share_links where token_hash = $1")
+        .bind(&token_hash)
         .fetch_optional(&state.pool)
         .await?;
     let missing = || ApiError::not_found("no such link");
@@ -89,8 +93,8 @@ pub async fn revoke_link(
         .await
         .map_err(|_| missing())?;
 
-    sqlx::query("update share_links set revoked = true where token = $1")
-        .bind(&token)
+    sqlx::query("update share_links set revoked = true where token_hash = $1")
+        .bind(&token_hash)
         .execute(&state.pool)
         .await?;
     Ok(StatusCode::NO_CONTENT)

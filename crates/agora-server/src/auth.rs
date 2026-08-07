@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand::{RngCore, rng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -156,6 +157,17 @@ pub fn random_share_token() -> String {
     let mut bytes = [0u8; SHARE_TOKEN_BYTES];
     rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The only form of a share link token the database ever holds, so a database
+/// read hands over no working link.
+///
+/// A plain digest and no salt on purpose: the token is 128 bits of csprng
+/// output, so there is no guessing surface for a password style kdf to defend,
+/// and a per row salt would cost the indexed equality lookup every consumer
+/// depends on.
+pub fn share_token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 /// A verified platform caller. Holding one is proof the signature and `exp`
@@ -383,6 +395,26 @@ mod tests {
         for _ in 0..256 {
             assert!(seen.insert(random_share_token()));
         }
+    }
+
+    #[test]
+    fn the_stored_hash_is_stable_hex_and_never_the_token() {
+        let token = random_share_token();
+        let hash = share_token_hash(&token);
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+        assert_ne!(hash, token);
+        assert_eq!(hash, share_token_hash(&token));
+        assert_ne!(hash, share_token_hash(&random_share_token()));
+
+        // the sha-256 of the empty string, so a swapped algorithm is caught
+        assert_eq!(
+            share_token_hash(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

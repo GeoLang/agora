@@ -12,11 +12,13 @@ rust-version.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+hex = "0.4"
 # 9, not 10: 10 pulls rsa 0.9 (RUSTSEC-2023-0071) and fails cargo-deny
 jsonwebtoken = "9"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", features = [
     "runtime-tokio",
     "postgres",

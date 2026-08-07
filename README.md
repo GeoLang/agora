@@ -157,6 +157,10 @@ one is an `error` message or a 4xx, never a panic.
 Share link tokens are 128 random bits, url safe. Session tokens expire after 12
 hours.
 
+The database stores only the SHA-256 of a share link token, so a database read
+hands over no working link. The raw token is returned once when the link is
+minted and never again.
+
 ## Revoking a share link
 
 Revoking stops link resolution and stops any new websocket connection using a
