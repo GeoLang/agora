@@ -135,15 +135,27 @@ impl DocumentState {
         key.len() + value_bytes(value)
     }
 
-    /// Size the state would have after this write, so a cap can be enforced
-    /// before anything is persisted.
-    pub fn projected_bytes(&self, key: &str, value: Option<&Value>) -> usize {
-        let replaced = self
-            .entries
-            .get(key)
-            .map_or(0, |entry| key.len() + entry.bytes);
-        let added = value.map_or(0, |value| Self::entry_bytes(key, value));
-        self.bytes.saturating_sub(replaced).saturating_add(added)
+    /// Size the state would have after these writes, so a cap can be enforced
+    /// before any of them is persisted. Writes that are individually small can
+    /// only be caught together, so a caller passes the whole group.
+    ///
+    /// A key written twice counts once, at its last write, which is where it
+    /// will land. Collecting into a map is what drops the earlier ones.
+    pub fn projected_bytes<'a>(
+        &self,
+        writes: impl IntoIterator<Item = (&'a str, Option<&'a Value>)>,
+    ) -> usize {
+        let last_writes: BTreeMap<&str, Option<&Value>> = writes.into_iter().collect();
+        let mut total = self.bytes;
+        for (key, value) in last_writes {
+            let replaced = self
+                .entries
+                .get(key)
+                .map_or(0, |entry| key.len() + entry.bytes);
+            let added = value.map_or(0, |value| Self::entry_bytes(key, value));
+            total = total.saturating_sub(replaced).saturating_add(added);
+        }
+        total
     }
 
     pub fn apply(&mut self, key: &str, value: Option<Value>) {
@@ -255,18 +267,53 @@ mod tests {
     fn projected_bytes_matches_the_size_after_the_write() {
         let mut state = DocumentState::new("plan");
         let value = json!({"order": "a0", "url": "http://example.test/tiles"});
-        let projected = state.projected_bytes("layers/a", Some(&value));
+        let projected = state.projected_bytes([("layers/a", Some(&value))]);
         state.apply("layers/a", Some(value.clone()));
         assert_eq!(projected, state.bytes());
 
         let replacement = json!({"order": "a1"});
-        let projected = state.projected_bytes("layers/a", Some(&replacement));
+        let projected = state.projected_bytes([("layers/a", Some(&replacement))]);
         state.apply("layers/a", Some(replacement));
         assert_eq!(projected, state.bytes());
 
-        let projected = state.projected_bytes("layers/a", None);
+        let projected = state.projected_bytes([("layers/a", None)]);
         state.apply("layers/a", None);
         assert_eq!(projected, state.bytes());
+    }
+
+    #[test]
+    fn projected_bytes_matches_the_size_after_a_whole_batch() {
+        let mut state = DocumentState::new("plan");
+        state.apply("layers/a", Some(json!({"order": "a0"})));
+
+        let replacement = json!({"order": "a1", "url": "http://example.test/tiles"});
+        let added = json!({"order": "a2"});
+        let writes = [
+            ("layers/a", Some(&replacement)),
+            ("layers/b", Some(&added)),
+            ("meta/name", None),
+        ];
+        let projected = state.projected_bytes(writes);
+        for (key, value) in writes {
+            state.apply(key, value.cloned());
+        }
+        assert_eq!(projected, state.bytes());
+    }
+
+    #[test]
+    fn projected_bytes_counts_a_repeated_key_once() {
+        let mut state = DocumentState::default();
+        let first = json!({"order": "a0"});
+        let last = json!({"order": "a1", "url": "http://example.test/tiles"});
+        let projected =
+            state.projected_bytes([("layers/a", Some(&first)), ("layers/a", Some(&last))]);
+        state.apply("layers/a", Some(last.clone()));
+        assert_eq!(projected, state.bytes());
+        assert_eq!(
+            projected,
+            state.projected_bytes([("layers/a", Some(&last))]),
+            "a repeated key was counted twice"
+        );
     }
 
     #[test]

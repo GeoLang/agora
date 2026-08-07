@@ -26,8 +26,12 @@ pub const MAX_USER_ID_BYTES: usize = 128;
 pub const MAX_INBOUND_FRAME_BYTES: usize = 128 * 1024;
 
 /// Inbound client messages allowed per second per connection, ops and
-/// presence together.
-pub const MAX_CLIENT_MESSAGES_PER_SECOND: u32 = 60;
+/// presence together. A batch counts as one message per op it carries.
+pub const MAX_CLIENT_MESSAGES_PER_SECOND: usize = 60;
+
+/// Ops in one batch frame. A larger batch could never be accepted anyway, since
+/// the rate limiter charges a batch per op.
+pub const MAX_BATCH_OPS: usize = MAX_CLIENT_MESSAGES_PER_SECOND;
 
 /// Connections allowed in one room.
 pub const MAX_PEERS_PER_DOCUMENT: usize = 32;
@@ -64,7 +68,7 @@ pub fn oldest_op_to_keep(checkpoint_seq: i64) -> Option<i64> {
 /// Fixed one second window counter, one per connection.
 pub struct RateLimiter {
     window_started: Instant,
-    seen: u32,
+    seen: usize,
 }
 
 impl RateLimiter {
@@ -76,12 +80,19 @@ impl RateLimiter {
     }
 
     pub fn allow(&mut self) -> bool {
+        self.allow_many(1)
+    }
+
+    /// Charge several messages at once, which is how a batch pays for every op
+    /// it carries rather than for the one frame it arrived in. A refused charge
+    /// still counts, so a client cannot probe the remaining budget for free.
+    pub fn allow_many(&mut self, count: usize) -> bool {
         let now = Instant::now();
         if now.duration_since(self.window_started) >= Duration::from_secs(1) {
             self.window_started = now;
             self.seen = 0;
         }
-        self.seen += 1;
+        self.seen = self.seen.saturating_add(count);
         self.seen <= MAX_CLIENT_MESSAGES_PER_SECOND
     }
 }
@@ -106,6 +117,17 @@ mod tests {
         }
         assert!(!limiter.allow());
         assert!(!limiter.allow());
+    }
+
+    #[test]
+    fn a_batch_charge_spends_the_window_and_sticks_after_a_refusal() {
+        let mut limiter = RateLimiter::new();
+        assert!(limiter.allow_many(MAX_CLIENT_MESSAGES_PER_SECOND));
+        assert!(!limiter.allow());
+
+        let mut limiter = RateLimiter::new();
+        assert!(!limiter.allow_many(MAX_CLIENT_MESSAGES_PER_SECOND + 1));
+        assert!(!limiter.allow(), "a refused batch left the budget unspent");
     }
 
     #[test]

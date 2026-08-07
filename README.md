@@ -105,11 +105,20 @@ retained tail still reaches back that far, otherwise the client gets a snapshot.
 ```json
 {"type": "op", "clientSeq": 4, "key": "layers/roads", "value": {"order": "a0"}}
 {"type": "op", "clientSeq": 5, "key": "layers/roads", "value": null}
+{"type": "batch", "clientSeq": 6, "ops": [{"key": "layers/roads", "value": {"order": "a1"}}, {"key": "layers/rail", "value": null}]}
 {"type": "presence", "cursor": [12.5, -3.25], "selection": ["layers/roads"], "viewport": {}}
 ```
 
 `value: null` deletes the key. The field is required, so a message that omits it
 is refused rather than deleting anything.
+
+A `batch` is several ops the server applies all or nothing, which is what keeps a
+multi feature paste or a multi layer reorder from rendering half done on a peer.
+Every op is validated before any of them is ordered, so one bad op refuses the
+whole frame with an `error` naming its position, and the document is left as it
+was. Duplicate keys inside a batch are allowed and settle last writer wins, the
+same as two separate ops. One `clientSeq` covers the batch and one `ack` answers
+it.
 
 Keys are `<namespace>/<id>` where the namespace is one of `meta`, `layers`,
 `annotations` or `bookmarks`, and the id is letters, digits, `-`, `_` or `.`.
@@ -120,6 +129,7 @@ Anything else is refused.
 ```json
 {"type": "snapshot", "seq": 12, "state": {}, "actor": "user-1", "role": "edit"}
 {"type": "op", "seq": 13, "actor": "user-1", "key": "layers/roads", "value": null}
+{"type": "batch", "actor": "user-1", "ops": [{"seq": 14, "key": "layers/roads", "value": {"order": "a1"}}, {"seq": 15, "key": "layers/rail", "value": null}]}
 {"type": "ack", "clientSeq": 4, "seq": 13}
 {"type": "peers", "peers": [{"actor": "user-1", "name": "Ada", "role": "edit"}]}
 {"type": "presence", "actor": "user-1", "cursor": [12.5, -3.25], "selection": [], "viewport": null}
@@ -132,6 +142,13 @@ connection stays open, unless the credential itself is the problem, which is a
 
 Apply ops in `seq` order. A client receives its own ops back alongside the `ack`,
 which is what keeps two tabs of one account in step.
+
+A batch takes one seq per op, so `batch` carries the same ops an `op` frame would
+and only groups them. Apply them in the order given and treat the last seq as the
+one reached. A batch of a single op relays as an `op`, since there is nothing to
+hold together. A reconnect with `since` replays a batch as separate `op` frames,
+which is a visible catch up rather than a live edit, and the state it arrives at
+is the same.
 
 A connection that falls far enough behind to lose messages is sent a fresh
 `snapshot` instead of the ops it missed, so presence traffic can be dropped under
@@ -160,7 +177,8 @@ one is an `error` message or a 4xx, never a panic.
 | Op value | 64 KiB of JSON |
 | Presence frame | 4 KiB |
 | Websocket frame | 128 KiB, larger closes the connection |
-| Client messages per connection | 60 per second, ops and presence together |
+| Client messages per connection | 60 per second, ops and presence together, a batch counting one per op |
+| Ops in one batch | 60, which is the whole per second budget |
 | Peers per document | 32 |
 | Document name | 200 bytes |
 | Member user id | 128 bytes |

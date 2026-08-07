@@ -2,12 +2,13 @@ use std::time::Duration;
 
 use agora_server::auth::{AuthConfig, share_token_hash};
 use agora_server::limits::{
-    MAX_CLIENT_MESSAGES_PER_SECOND, MAX_DOCUMENT_NAME_BYTES, MAX_INBOUND_FRAME_BYTES,
-    MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES,
-    MAX_USER_ID_BYTES,
+    MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND, MAX_DOCUMENT_NAME_BYTES,
+    MAX_DOCUMENT_STATE_BYTES, MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES,
+    MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
 };
-use agora_server::protocol::Peer;
+use agora_server::protocol::{BatchOp, OpValue, Peer};
 use agora_server::role::DocumentRole;
+use agora_server::state::META_NAME_KEY;
 use agora_server::{AppState, migrate, router};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -325,6 +326,11 @@ impl WebsocketClient {
             .await;
     }
 
+    async fn send_batch(&mut self, client_seq: i64, ops: Vec<Value>) {
+        self.send(json!({"type": "batch", "clientSeq": client_seq, "ops": ops}))
+            .await;
+    }
+
     async fn send(&mut self, message: Value) {
         self.stream
             .send(Message::text(message.to_string()))
@@ -364,6 +370,56 @@ async fn send_and_settle(
         }
     }
     panic!("op {client_seq} was never settled")
+}
+
+fn batch_op(key: &str, value: Value) -> Value {
+    json!({"key": key, "value": value})
+}
+
+/// Send a batch and read until its ack, which is the last thing it produces for
+/// the sender. Returns the seq of its last op.
+async fn send_batch_and_settle(
+    client: &mut WebsocketClient,
+    client_seq: i64,
+    ops: Vec<Value>,
+) -> i64 {
+    client.send_batch(client_seq, ops).await;
+    for _ in 0..8 {
+        let message = client.next_message().await;
+        match message["type"].as_str() {
+            Some("ack") => {
+                assert_eq!(message["clientSeq"], client_seq);
+                return message["seq"].as_i64().expect("a seq");
+            }
+            Some("op") | Some("batch") | Some("peers") => continue,
+            _ => panic!("unexpected message {message}"),
+        }
+    }
+    panic!("batch {client_seq} was never acked")
+}
+
+/// Send a batch that should be refused and return the reason given.
+async fn send_batch_and_refuse(
+    client: &mut WebsocketClient,
+    client_seq: i64,
+    ops: Vec<Value>,
+) -> String {
+    client.send_batch(client_seq, ops).await;
+    for _ in 0..8 {
+        let message = client.next_message().await;
+        match message["type"].as_str() {
+            Some("error") => return message["reason"].as_str().expect("a reason").to_string(),
+            Some("peers") => continue,
+            _ => panic!("unexpected message {message}"),
+        }
+    }
+    panic!("batch {client_seq} was never refused")
+}
+
+/// The seq and state a client that joins now would be given.
+async fn stored_document(app: &TestApp, document_id: Uuid, token: &str) -> Value {
+    let mut fresh = open(app, document_id, token, None).await;
+    fresh.expect_message("snapshot").await
 }
 
 /// Send an op that should be refused and return the reason given.
@@ -595,6 +651,128 @@ async fn two_ops_on_one_key_settle_on_the_server_order_for_both_clients() {
             "the later write did not win"
         );
     }
+}
+
+#[tokio::test]
+async fn a_batch_applies_every_op_and_reaches_a_peer_as_one_frame() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let token = platform_token(&owner);
+    let document_id = create_document(&app, &token, "batching").await;
+    let guest_token = guest_session(&app, &token, document_id, "edit").await;
+
+    let mut owner_client = open(&app, document_id, &token, None).await;
+    expect_join(&mut owner_client).await;
+    let mut guest_client = open(&app, document_id, &guest_token, None).await;
+    expect_join(&mut guest_client).await;
+    owner_client.expect_message("peers").await;
+
+    assert_eq!(
+        send_batch_and_settle(
+            &mut owner_client,
+            4,
+            vec![
+                batch_op("layers/a", json!({"order": "a0"})),
+                batch_op("layers/b", json!({"order": "a1"})),
+                batch_op("layers/c", json!({"order": "a2"})),
+            ],
+        )
+        .await,
+        3
+    );
+
+    let relayed = guest_client.expect_message("batch").await;
+    assert_eq!(relayed["actor"], owner.as_str());
+    assert_eq!(
+        relayed["ops"],
+        json!([
+            {"seq": 1, "key": "layers/a", "value": {"order": "a0"}},
+            {"seq": 2, "key": "layers/b", "value": {"order": "a1"}},
+            {"seq": 3, "key": "layers/c", "value": {"order": "a2"}},
+        ]),
+        "the ops did not arrive together in one frame"
+    );
+
+    let snapshot = stored_document(&app, document_id, &token).await;
+    assert_eq!(snapshot["seq"], 3);
+    for (id, order) in [("a", "a0"), ("b", "a1"), ("c", "a2")] {
+        assert_eq!(snapshot["state"]["layers"][id]["order"], order);
+    }
+}
+
+#[tokio::test]
+async fn a_batch_with_one_bad_op_applies_none_of_them() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "atomic batch").await;
+
+    let mut client = open(&app, document_id, &token, None).await;
+    expect_join(&mut client).await;
+
+    let good = batch_op("layers/kept", json!({"order": "a0"}));
+    for (ops, reason) in [
+        (
+            vec![good.clone(), batch_op("secrets/root", json!(true))],
+            "op 1: unknown key namespace",
+        ),
+        (
+            vec![
+                batch_op("layers/big", json!("x".repeat(MAX_OP_VALUE_BYTES))),
+                good.clone(),
+            ],
+            "op 0: op value too large",
+        ),
+        (
+            vec![good.clone(), batch_op("meta/name", json!(7))],
+            "op 1: invalid document name",
+        ),
+    ] {
+        assert_eq!(send_batch_and_refuse(&mut client, 1, ops).await, reason);
+    }
+
+    let snapshot = stored_document(&app, document_id, &token).await;
+    assert_eq!(snapshot["seq"], 0, "a refused batch still spent a seq");
+    assert!(
+        snapshot["state"]["layers"].get("kept").is_none(),
+        "a refused batch wrote one of its ops"
+    );
+
+    // the same ops without the bad one are fine, so nothing but the bad entry
+    // was the problem
+    assert_eq!(send_batch_and_settle(&mut client, 2, vec![good]).await, 1);
+}
+
+#[tokio::test]
+async fn one_key_written_twice_in_a_batch_settles_on_the_last_write() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "batch duplicates").await;
+
+    let mut client = open(&app, document_id, &token, None).await;
+    expect_join(&mut client).await;
+
+    assert_eq!(
+        send_batch_and_settle(
+            &mut client,
+            1,
+            vec![
+                batch_op("layers/a", json!({"order": "first"})),
+                batch_op("layers/b", json!({"order": "kept"})),
+                batch_op("layers/a", json!({"order": "last"})),
+                batch_op("layers/b", Value::Null),
+            ],
+        )
+        .await,
+        4
+    );
+
+    let snapshot = stored_document(&app, document_id, &token).await;
+    assert_eq!(snapshot["seq"], 4);
+    assert_eq!(snapshot["state"]["layers"]["a"]["order"], "last");
+    assert!(
+        snapshot["state"]["layers"].get("b").is_none(),
+        "a delete later in the batch did not win"
+    );
 }
 
 #[tokio::test]
@@ -1038,6 +1216,136 @@ async fn the_document_state_cap_refuses_an_op_that_would_exceed_it() {
 }
 
 #[tokio::test]
+async fn the_document_state_cap_refuses_a_batch_that_no_single_op_would_trip() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let token = platform_token(&owner);
+    let name = "cumulative cap";
+    let document_id = create_document(&app, &token, name).await;
+
+    let peer = Peer {
+        actor: owner.clone(),
+        name: owner.clone(),
+        role: DocumentRole::Edit,
+    };
+    let joined = app
+        .state
+        .rooms
+        .join(&app.state.pool, document_id, peer)
+        .await
+        .expect("join");
+
+    // fill to just under the cap, counting the way the server does: the key
+    // length plus the json length of the value, for the name it was created with
+    // and then for every chunk
+    let chunk = json!("x".repeat(MAX_OP_VALUE_BYTES - 2));
+    let mut used = META_NAME_KEY.len() + name.len() + 2;
+    let mut client_seq = 0;
+    loop {
+        let key = format!("layers/l{client_seq:02}");
+        if used + key.len() + MAX_OP_VALUE_BYTES > MAX_DOCUMENT_STATE_BYTES {
+            break;
+        }
+        joined
+            .room
+            .apply_op(
+                &app.state.pool,
+                &owner,
+                client_seq,
+                &key,
+                Some(chunk.clone()),
+            )
+            .await
+            .expect("a chunk that fits");
+        used += key.len() + MAX_OP_VALUE_BYTES;
+        client_seq += 1;
+    }
+
+    let headroom = MAX_DOCUMENT_STATE_BYTES - used;
+    let key_bytes = "layers/m0".len();
+    let value_bytes = headroom * 3 / 5;
+    assert!(
+        key_bytes + value_bytes <= headroom,
+        "each op has to fit in the headroom on its own"
+    );
+    assert!(
+        2 * (key_bytes + value_bytes) > headroom,
+        "the two ops together have to pass the cap"
+    );
+    let value = json!("x".repeat(value_bytes - 2));
+
+    let refusal = joined
+        .room
+        .apply_batch(
+            &app.state.pool,
+            &owner,
+            client_seq,
+            &[
+                BatchOp {
+                    key: "layers/m0".to_string(),
+                    value: OpValue(Some(value.clone())),
+                },
+                BatchOp {
+                    key: "layers/m1".to_string(),
+                    value: OpValue(Some(value.clone())),
+                },
+            ],
+        )
+        .await
+        .expect_err("the pair passes the cap together");
+    assert_eq!(refusal.reason(), "document state limit reached");
+
+    let (_, state) = joined.room.snapshot().await;
+    assert!(
+        state["layers"].get("m0").is_none() && state["layers"].get("m1").is_none(),
+        "a refused batch wrote one of its ops"
+    );
+
+    // the same op on its own is accepted, so it was only the pair that was over
+    joined
+        .room
+        .apply_op(
+            &app.state.pool,
+            &owner,
+            client_seq + 1,
+            "layers/m0",
+            Some(value),
+        )
+        .await
+        .expect("one of the pair fits on its own");
+
+    app.state
+        .rooms
+        .leave(document_id, joined.connection_id)
+        .await;
+}
+
+#[tokio::test]
+async fn a_batch_past_the_op_cap_or_with_no_ops_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "batch cap").await;
+
+    let mut client = open(&app, document_id, &token, None).await;
+    expect_join(&mut client).await;
+
+    let over_cap = (0..=MAX_BATCH_OPS)
+        .map(|index| batch_op(&format!("layers/l{index}"), json!({"order": "a0"})))
+        .collect();
+    assert_eq!(
+        send_batch_and_refuse(&mut client, 1, over_cap).await,
+        "batch too large"
+    );
+    assert_eq!(
+        send_batch_and_refuse(&mut client, 2, Vec::new()).await,
+        "batch carries no ops"
+    );
+
+    let snapshot = stored_document(&app, document_id, &token).await;
+    assert_eq!(snapshot["seq"], 0);
+}
+
+#[tokio::test]
 async fn the_rate_limit_refuses_a_flood_and_keeps_the_connection() {
     let app = spawn_app().await;
     let token = platform_token(&fresh_user());
@@ -1050,7 +1358,7 @@ async fn the_rate_limit_refuses_a_flood_and_keeps_the_connection() {
     expect_join(&mut watcher).await;
     flooder.expect_message("peers").await;
 
-    let cap = MAX_CLIENT_MESSAGES_PER_SECOND as usize;
+    let cap = MAX_CLIENT_MESSAGES_PER_SECOND;
     let flood = cap * 2;
     for _ in 0..flood {
         flooder
@@ -1090,6 +1398,47 @@ async fn the_rate_limit_refuses_a_flood_and_keeps_the_connection() {
     assert!(
         matches!(reply["type"].as_str(), Some("ack") | Some("error")),
         "the connection stopped answering: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_charges_the_rate_limit_for_every_op_it_carries() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "batch rate").await;
+
+    let full_batch = || -> Vec<Value> {
+        (0..MAX_BATCH_OPS)
+            .map(|index| batch_op(&format!("layers/l{index}"), json!({"order": "a0"})))
+            .collect()
+    };
+
+    // one op leaves room for one short of a full batch, so the batch that
+    // follows it is a single op over the budget and is refused whole
+    let mut spent = open(&app, document_id, &token, None).await;
+    expect_join(&mut spent).await;
+    assert_eq!(
+        send_and_settle(&mut spent, 1, "layers/first", json!({"order": "a0"})).await,
+        1
+    );
+    assert_eq!(
+        send_batch_and_refuse(&mut spent, 2, full_batch()).await,
+        "rate limit exceeded"
+    );
+
+    let snapshot = stored_document(&app, document_id, &token).await;
+    assert_eq!(
+        snapshot["seq"], 1,
+        "a batch past the rate limit was still applied"
+    );
+
+    // a connection with its whole budget takes the same batch, so the cap and
+    // the batch size agree
+    let mut fresh = open(&app, document_id, &token, None).await;
+    expect_join(&mut fresh).await;
+    assert_eq!(
+        send_batch_and_settle(&mut fresh, 1, full_batch()).await,
+        1 + MAX_BATCH_OPS as i64
     );
 }
 

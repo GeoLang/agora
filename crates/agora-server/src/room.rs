@@ -11,7 +11,7 @@ use crate::limits::{
     CHECKPOINT_INTERVAL_OPS, MAX_DOCUMENT_STATE_BYTES, MAX_PEERS_PER_DOCUMENT,
     ROOM_BROADCAST_CAPACITY, oldest_op_to_keep,
 };
-use crate::protocol::{Peer, ServerMessage};
+use crate::protocol::{AppliedOp, BatchOp, OpValue, Peer, ServerMessage};
 use crate::state::{
     DocumentState, KeyError, META_NAME_KEY, op_value_within_cap, parse_key, valid_document_name,
 };
@@ -33,6 +33,39 @@ impl OpError {
             OpError::StateTooLarge => "document state limit reached",
             OpError::InvalidName => "invalid document name",
             OpError::Database(_) => "database error",
+        }
+    }
+}
+
+/// Why a batch was refused, and which entry is to blame when one of them is.
+/// The cumulative state cap and a database failure belong to the whole frame,
+/// so there `index` is `None`.
+#[derive(Debug)]
+pub struct BatchError {
+    pub index: Option<usize>,
+    pub error: OpError,
+}
+
+impl BatchError {
+    fn entry(index: usize, error: OpError) -> Self {
+        Self {
+            index: Some(index),
+            error,
+        }
+    }
+
+    fn whole(error: OpError) -> Self {
+        Self { index: None, error }
+    }
+
+    fn database(error: sqlx::Error) -> Self {
+        Self::whole(OpError::Database(error))
+    }
+
+    pub fn reason(&self) -> String {
+        match self.index {
+            Some(index) => format!("op {index}: {}", self.error.reason()),
+            None => self.error.reason().to_string(),
         }
     }
 }
@@ -161,54 +194,91 @@ impl Room {
         key: &str,
         value: Option<Value>,
     ) -> Result<i64, OpError> {
-        parse_key(key).map_err(OpError::Key)?;
-        if let Some(value) = &value
-            && !op_value_within_cap(value)
-        {
-            return Err(OpError::ValueTooLarge);
+        let op = BatchOp {
+            key: key.to_string(),
+            value: OpValue(value),
+        };
+        self.apply_batch(pool, actor, client_seq, &[op])
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Validate, order, persist, apply and fan out several ops as one unit.
+    /// Returns the seq of the last one.
+    ///
+    /// Nothing is written and no seq is spent until every entry has passed, so
+    /// a refused batch leaves the document exactly as it was. Duplicate keys are
+    /// allowed and settle last writer wins, the same as two separate ops would.
+    ///
+    /// The ops take consecutive seqs, one row each, because the `ops` table is
+    /// keyed by them. What a batch buys is the single relayed frame, so peers
+    /// apply the whole group or none of it.
+    ///
+    /// An empty batch is refused before this, in the websocket handler.
+    pub async fn apply_batch(
+        &self,
+        pool: &PgPool,
+        actor: &str,
+        client_seq: i64,
+        ops: &[BatchOp],
+    ) -> Result<i64, BatchError> {
+        let mut document_name = None;
+        for (index, op) in ops.iter().enumerate() {
+            let named = self
+                .validate(&op.key, op.value.0.as_ref())
+                .map_err(|error| BatchError::entry(index, error))?;
+            if let Some(name) = named {
+                document_name = Some(name);
+            }
         }
-        let document_name = self.document_name_from(key, value.as_ref())?;
 
         let mut inner = self.inner.lock().await;
-        if inner.state.projected_bytes(key, value.as_ref()) > MAX_DOCUMENT_STATE_BYTES {
-            return Err(OpError::StateTooLarge);
+        let writes = ops.iter().map(|op| (op.key.as_str(), op.value.0.as_ref()));
+        if inner.state.projected_bytes(writes) > MAX_DOCUMENT_STATE_BYTES {
+            return Err(BatchError::whole(OpError::StateTooLarge));
         }
-        let seq = inner.seq + 1;
 
-        let mut transaction = pool.begin().await.map_err(OpError::Database)?;
-        sqlx::query(
-            "insert into ops (doc_id, seq, actor, key, value, client_seq)
-             values ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(self.document_id)
-        .bind(seq)
-        .bind(actor)
-        .bind(key)
-        .bind(&value)
-        .bind(client_seq)
-        .execute(&mut *transaction)
-        .await
-        .map_err(OpError::Database)?;
+        let mut seq = inner.seq;
+        let mut applied = Vec::with_capacity(ops.len());
+        let mut transaction = pool.begin().await.map_err(BatchError::database)?;
+        for op in ops {
+            seq += 1;
+            sqlx::query(
+                "insert into ops (doc_id, seq, actor, key, value, client_seq)
+                 values ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(self.document_id)
+            .bind(seq)
+            .bind(actor)
+            .bind(&op.key)
+            .bind(&op.value.0)
+            .bind(client_seq)
+            .execute(&mut *transaction)
+            .await
+            .map_err(BatchError::database)?;
+            applied.push(AppliedOp {
+                seq,
+                key: op.key.clone(),
+                value: op.value.0.clone(),
+            });
+        }
         if let Some(name) = document_name {
             sqlx::query("update documents set name = $1 where id = $2")
                 .bind(name)
                 .bind(self.document_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(OpError::Database)?;
+                .map_err(BatchError::database)?;
         }
-        transaction.commit().await.map_err(OpError::Database)?;
+        transaction.commit().await.map_err(BatchError::database)?;
 
-        inner.state.apply(key, value.clone());
+        for op in &applied {
+            inner.state.apply(&op.key, op.value.clone());
+            inner.ops_since_checkpoint += 1;
+        }
         inner.seq = seq;
-        inner.ops_since_checkpoint += 1;
 
-        self.relay(&ServerMessage::Op {
-            seq,
-            actor: actor.to_string(),
-            key: key.to_string(),
-            value,
-        });
+        self.relay(&relay_frame(actor, applied));
 
         if inner.ops_since_checkpoint >= CHECKPOINT_INTERVAL_OPS {
             let folded = inner.state.snapshot();
@@ -219,6 +289,18 @@ impl Room {
             }
         }
         Ok(seq)
+    }
+
+    /// Everything that can refuse an op before the server orders it, and the
+    /// document name to store when the op carries one.
+    fn validate(&self, key: &str, value: Option<&Value>) -> Result<Option<String>, OpError> {
+        parse_key(key).map_err(OpError::Key)?;
+        if let Some(value) = value
+            && !op_value_within_cap(value)
+        {
+            return Err(OpError::ValueTooLarge);
+        }
+        self.document_name_from(key, value)
     }
 
     /// `meta/name` is the one key with server meaning, so it has to hold a name
@@ -256,6 +338,23 @@ impl Room {
                 .await?;
         }
         transaction.commit().await
+    }
+}
+
+/// One op goes out as an `op` and several as a `batch`, so a batch is on the
+/// wire only when there is something to hold together.
+fn relay_frame(actor: &str, applied: Vec<AppliedOp>) -> ServerMessage {
+    match <[AppliedOp; 1]>::try_from(applied) {
+        Ok([single]) => ServerMessage::Op {
+            seq: single.seq,
+            actor: actor.to_string(),
+            key: single.key,
+            value: single.value,
+        },
+        Err(several) => ServerMessage::Batch {
+            actor: actor.to_string(),
+            ops: several,
+        },
     }
 }
 

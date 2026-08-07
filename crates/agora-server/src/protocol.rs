@@ -26,6 +26,14 @@ impl<'de> Deserialize<'de> for OpValue {
     }
 }
 
+/// One entry of a batch: what an op carries minus the `clientSeq`, which the
+/// frame holds once for the whole batch.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BatchOp {
+    pub key: String,
+    pub value: OpValue,
+}
+
 /// A message a client may send.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -36,6 +44,13 @@ pub enum ClientMessage {
         key: String,
         value: OpValue,
     },
+    /// Ops the server applies all or nothing, so peers never render a torn
+    /// intermediate state.
+    Batch {
+        #[serde(rename = "clientSeq")]
+        client_seq: i64,
+        ops: Vec<BatchOp>,
+    },
     Presence {
         #[serde(default)]
         cursor: Option<[f64; 2]>,
@@ -44,6 +59,16 @@ pub enum ClientMessage {
         #[serde(default)]
         viewport: Option<Value>,
     },
+}
+
+/// One op the server has ordered, as it appears inside a relayed batch. Each
+/// carries its own seq, so a batch decomposes into exactly the `op` frames a
+/// reconnect would replay.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedOp {
+    pub seq: i64,
+    pub key: String,
+    pub value: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +94,10 @@ pub enum ServerMessage {
         actor: String,
         key: String,
         value: Option<Value>,
+    },
+    Batch {
+        actor: String,
+        ops: Vec<AppliedOp>,
     },
     Ack {
         #[serde(rename = "clientSeq")]
@@ -150,6 +179,59 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_parses_its_ops_in_order_with_null_as_a_delete() {
+        let parsed = parse(
+            r#"{"type":"batch","clientSeq":9,"ops":[
+                {"key":"layers/a","value":{"order":"a0"}},
+                {"key":"layers/b","value":null}
+            ]}"#,
+        )
+        .unwrap();
+        match parsed {
+            ClientMessage::Batch { client_seq, ops } => {
+                assert_eq!(client_seq, 9);
+                assert_eq!(
+                    ops,
+                    vec![
+                        BatchOp {
+                            key: "layers/a".to_string(),
+                            value: OpValue(Some(json!({"order": "a0"}))),
+                        },
+                        BatchOp {
+                            key: "layers/b".to_string(),
+                            value: OpValue(None),
+                        },
+                    ]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        assert!(parse(r#"{"type":"batch","clientSeq":9,"ops":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn a_batch_entry_without_a_value_field_is_refused() {
+        assert!(
+            parse(
+                r#"{"type":"batch","clientSeq":9,"ops":[
+                    {"key":"layers/a","value":null},
+                    {"key":"layers/b"}
+                ]}"#
+            )
+            .is_err()
+        );
+        for text in [
+            r#"{"type":"batch","clientSeq":9}"#,
+            r#"{"type":"batch","ops":[]}"#,
+            r#"{"type":"batch","clientSeq":9,"ops":{"key":"layers/a","value":null}}"#,
+            r#"{"type":"batch","clientSeq":9,"ops":[{"value":null}]}"#,
+        ] {
+            assert!(parse(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
     fn unknown_message_types_and_junk_are_refused() {
         for text in [
             r#"{"type":"checkpoint"}"#,
@@ -223,6 +305,33 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&op.encode()).unwrap(),
             json!({"type": "op", "seq": 8, "actor": "user-1", "key": "layers/a", "value": null})
+        );
+
+        let batch = ServerMessage::Batch {
+            actor: "user-1".to_string(),
+            ops: vec![
+                AppliedOp {
+                    seq: 9,
+                    key: "layers/a".to_string(),
+                    value: Some(json!({"order": "a0"})),
+                },
+                AppliedOp {
+                    seq: 10,
+                    key: "layers/b".to_string(),
+                    value: None,
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&batch.encode()).unwrap(),
+            json!({
+                "type": "batch",
+                "actor": "user-1",
+                "ops": [
+                    {"seq": 9, "key": "layers/a", "value": {"order": "a0"}},
+                    {"seq": 10, "key": "layers/b", "value": null}
+                ]
+            })
         );
 
         let ack = ServerMessage::Ack {

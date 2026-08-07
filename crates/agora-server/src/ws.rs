@@ -16,7 +16,8 @@ use crate::auth::{BEARER_SUBPROTOCOL, websocket_token};
 use crate::documents::member_role;
 use crate::error::ApiError;
 use crate::limits::{
-    DIRECT_CHANNEL_CAPACITY, MAX_INBOUND_FRAME_BYTES, MAX_PRESENCE_BYTES, RateLimiter,
+    DIRECT_CHANNEL_CAPACITY, MAX_BATCH_OPS, MAX_INBOUND_FRAME_BYTES, MAX_PRESENCE_BYTES,
+    RateLimiter,
 };
 use crate::links::live_link;
 use crate::protocol::{ClientMessage, Peer, ServerMessage};
@@ -333,6 +334,29 @@ async fn handle_text(
             {
                 Ok(seq) => deliver(direct, ServerMessage::Ack { client_seq, seq }),
                 Err(error) => refuse(direct, error.reason()),
+            }
+        }
+        ClientMessage::Batch { client_seq, ops } => {
+            if !identity.role.can_edit() {
+                return refuse(direct, "edit role required");
+            }
+            if ops.is_empty() {
+                return refuse(direct, "batch carries no ops");
+            }
+            if ops.len() > MAX_BATCH_OPS {
+                return refuse(direct, "batch too large");
+            }
+            // the frame itself was charged above, so the rest of its ops are
+            // charged here and grouping ops buys none of them
+            if !limiter.allow_many(ops.len() - 1) {
+                return refuse(direct, "rate limit exceeded");
+            }
+            match room
+                .apply_batch(&state.pool, &identity.actor, client_seq, &ops)
+                .await
+            {
+                Ok(seq) => deliver(direct, ServerMessage::Ack { client_seq, seq }),
+                Err(error) => refuse(direct, &error.reason()),
             }
         }
         ClientMessage::Presence {
