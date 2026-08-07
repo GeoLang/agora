@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgConnection, PgExecutor, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -15,15 +15,19 @@ use crate::state::{DocumentState, valid_document_name};
 
 /// The caller's role on a document, or `None` when they are not a member. An
 /// unreadable role denies access rather than defaulting to one.
+///
+/// Takes any executor so a mutation can read the role on its own transaction's
+/// connection, where a lock already held there covers the row, rather than on a
+/// pool connection where the answer can go stale before the write.
 pub async fn member_role(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     document_id: Uuid,
     user_id: &str,
 ) -> Result<Option<DocumentRole>, sqlx::Error> {
     let row = sqlx::query("select role from members where doc_id = $1 and user_id = $2")
         .bind(document_id)
         .bind(user_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
     let Some(row) = row else {
         return Ok(None);
@@ -35,21 +39,24 @@ pub async fn member_role(
 /// A non member gets the same answer as someone asking about a document that
 /// does not exist, so document ids cannot be probed.
 pub async fn require_member(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     document_id: Uuid,
     user_id: &str,
 ) -> Result<DocumentRole, ApiError> {
-    member_role(pool, document_id, user_id)
+    member_role(executor, document_id, user_id)
         .await?
         .ok_or_else(|| ApiError::not_found("no such document"))
 }
 
 pub async fn require_editor(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     document_id: Uuid,
     user_id: &str,
 ) -> Result<(), ApiError> {
-    if require_member(pool, document_id, user_id).await?.can_edit() {
+    if require_member(executor, document_id, user_id)
+        .await?
+        .can_edit()
+    {
         return Ok(());
     }
     Err(ApiError::forbidden("edit role required"))
@@ -212,6 +219,11 @@ fn valid_user_id(user_id: &str) -> bool {
 /// The document's edit members, locked for the rest of the transaction. Without
 /// the lock two concurrent removals each see the other editor and commit,
 /// leaving the document with none.
+///
+/// The lock also covers the caller's own row whenever the caller is an editor,
+/// which is what makes the role check that follows it trustworthy: a concurrent
+/// demotion of the caller either lands before this lock and is seen, or blocks
+/// behind it until the mutation has committed.
 async fn lock_editors(
     connection: &mut PgConnection,
     document_id: Uuid,
@@ -239,13 +251,13 @@ pub async fn set_member(
     Path((document_id, user_id)): Path<(Uuid, String)>,
     Json(request): Json<SetMemberRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_editor(&state.pool, document_id, &caller.user_id).await?;
+    let mut transaction = state.pool.begin().await?;
+    let editors = lock_editors(&mut transaction, document_id).await?;
+    require_editor(&mut *transaction, document_id, &caller.user_id).await?;
     if !valid_user_id(&user_id) {
         return Err(ApiError::bad_request("invalid user id"));
     }
 
-    let mut transaction = state.pool.begin().await?;
-    let editors = lock_editors(&mut transaction, document_id).await?;
     if !request.role.can_edit() && is_the_last_editor(&editors, &user_id) {
         return Err(ApiError::bad_request("the last editor cannot be demoted"));
     }
@@ -268,10 +280,10 @@ pub async fn remove_member(
     caller: Caller,
     Path((document_id, user_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_editor(&state.pool, document_id, &caller.user_id).await?;
-
     let mut transaction = state.pool.begin().await?;
     let editors = lock_editors(&mut transaction, document_id).await?;
+    require_editor(&mut *transaction, document_id, &caller.user_id).await?;
+
     if is_the_last_editor(&editors, &user_id) {
         return Err(ApiError::bad_request("the last editor cannot be removed"));
     }

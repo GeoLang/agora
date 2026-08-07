@@ -1673,6 +1673,87 @@ async fn only_an_editor_can_manage_members() {
     assert_eq!(roles, expected, "a refused call changed the member list");
 }
 
+/// The role that decides a membership call is read at mutation time, not
+/// carried over from an earlier call, so losing edit role takes effect at once.
+#[tokio::test]
+async fn a_demoted_editor_can_no_longer_manage_members() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "role recheck").await;
+
+    let successor = fresh_user();
+    let successor_token = platform_token(&successor);
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &successor, "edit")
+            .await
+            .status(),
+        204
+    );
+
+    let target = fresh_user();
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &target, "view")
+            .await
+            .status(),
+        204,
+        "an editor could not add a member"
+    );
+
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &owner, "view")
+            .await
+            .status(),
+        204
+    );
+
+    // the same caller, the same routes, one role change in between
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &target, "edit")
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        remove_member(&app, &owner_token, document_id, &target)
+            .await
+            .status(),
+        403
+    );
+
+    let stranger_token = platform_token(&fresh_user());
+    assert_eq!(
+        set_member(&app, &stranger_token, document_id, &target, "edit")
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        remove_member(&app, &stranger_token, document_id, &target)
+            .await
+            .status(),
+        404
+    );
+
+    let mut roles = member_roles(&app, &successor_token, document_id).await;
+    roles.sort();
+    let mut expected = vec![
+        (owner, "view".to_string()),
+        (successor.clone(), "edit".to_string()),
+        (target.clone(), "view".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(roles, expected, "a refused call changed the member list");
+
+    assert_eq!(
+        remove_member(&app, &successor_token, document_id, &target)
+            .await
+            .status(),
+        204,
+        "the remaining editor lost member management"
+    );
+}
+
 #[tokio::test]
 async fn the_last_editor_cannot_be_removed_or_demoted() {
     let app = spawn_app().await;
