@@ -1,6 +1,6 @@
 use agora_server::auth::AuthConfig;
 use agora_server::{
-    AppState, BIND_ENV, DATABASE_URL_ENV, DEFAULT_BIND, connect_pool, migrate, router,
+    AppState, DATABASE_URL_ENV, DEFAULT_PORT, PORT_ENV, connect_pool, migrate, router,
 };
 
 #[tokio::main]
@@ -23,7 +23,13 @@ async fn start() -> Result<(), String> {
         .await
         .map_err(|error| format!("could not apply migrations: {error}"))?;
 
-    let bind = std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let port = match std::env::var(PORT_ENV) {
+        Ok(value) => value
+            .parse::<u16>()
+            .map_err(|_| format!("{PORT_ENV} is not a port number: {value}"))?,
+        Err(_) => DEFAULT_PORT,
+    };
+    let bind = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|error| format!("could not bind {bind}: {error}"))?;

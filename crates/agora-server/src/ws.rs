@@ -21,7 +21,7 @@ use crate::limits::{
 use crate::links::live_link;
 use crate::protocol::{ClientMessage, Peer, ServerMessage};
 use crate::role::DocumentRole;
-use crate::room::{JoinError, Room, oldest_retained_op, ops_between};
+use crate::room::{JoinError, Room, RoomEvent, oldest_retained_op, ops_between};
 
 /// Display name for anyone who arrived through a share link. They have no
 /// platform identity, so there is no name to show beyond this.
@@ -35,6 +35,7 @@ pub struct WebsocketQuery {
     token: Option<String>,
 }
 
+#[derive(Clone)]
 struct Identity {
     actor: String,
     name: String,
@@ -126,7 +127,15 @@ async fn run(
     };
 
     let (mut sink, stream) = socket.split();
-    let opening = opening_messages(&state.pool, document_id, since, joined.seq, joined.state).await;
+    let opening = opening_messages(
+        &state.pool,
+        document_id,
+        since,
+        joined.seq,
+        joined.state,
+        &identity,
+    )
+    .await;
     for message in opening {
         if sink
             .send(Message::text(message.encode().as_ref()))
@@ -145,11 +154,20 @@ async fn run(
         Arc::clone(&room),
         joined.receiver,
         direct_receiver,
+        joined.connection_id,
+        identity.clone(),
     ));
 
     tokio::select! {
         _ = &mut sending => {}
-        _ = receive_loop(&state, &room, &identity, stream, direct_sender) => {}
+        _ = receive_loop(
+            &state,
+            &room,
+            &identity,
+            joined.connection_id,
+            stream,
+            direct_sender,
+        ) => {}
     }
     sending.abort();
     state.rooms.leave(document_id, joined.connection_id).await;
@@ -179,13 +197,9 @@ async fn opening_messages(
     since: Option<i64>,
     seq: i64,
     state: serde_json::Value,
+    identity: &Identity,
 ) -> Vec<ServerMessage> {
-    let snapshot = || {
-        vec![ServerMessage::Snapshot {
-            seq,
-            state: state.clone(),
-        }]
-    };
+    let snapshot = || vec![snapshot_message(seq, state.clone(), identity)];
     let Some(since) = since else {
         return snapshot();
     };
@@ -206,11 +220,22 @@ async fn opening_messages(
     }
 }
 
+fn snapshot_message(seq: i64, state: serde_json::Value, identity: &Identity) -> ServerMessage {
+    ServerMessage::Snapshot {
+        seq,
+        state,
+        actor: identity.actor.clone(),
+        role: identity.role,
+    }
+}
+
 async fn send_loop(
     mut sink: SplitSink<WebSocket, Message>,
     room: Arc<Room>,
-    mut fanned: broadcast::Receiver<Arc<str>>,
+    mut fanned: broadcast::Receiver<RoomEvent>,
     mut direct: mpsc::Receiver<Arc<str>>,
+    connection_id: u64,
+    identity: Identity,
 ) {
     loop {
         let text = tokio::select! {
@@ -219,12 +244,13 @@ async fn send_loop(
                 None => break,
             },
             relayed = fanned.recv() => match relayed {
-                Ok(text) => text,
+                Ok(event) if event.skip_connection == Some(connection_id) => continue,
+                Ok(event) => event.text,
                 // this connection fell too far behind to be caught up op by
                 // op, so it gets the current state instead
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let (seq, state) = room.snapshot().await;
-                    ServerMessage::Snapshot { seq, state }.encode()
+                    snapshot_message(seq, state, &identity).encode()
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -235,39 +261,43 @@ async fn send_loop(
     }
 }
 
-enum Flow {
-    Continue,
-    Close,
+/// Best effort delivery to one client. A burst of refusals larger than the
+/// buffer loses messages rather than the connection, which is what keeps a rate
+/// limited client connected.
+fn deliver(direct: &mpsc::Sender<Arc<str>>, message: ServerMessage) {
+    let _ = direct.try_send(message.encode());
 }
 
-/// Tell the client why a message was refused and keep the connection. A client
-/// that is not draining its own errors is closed instead of buffered.
-fn refuse(direct: &mpsc::Sender<Arc<str>>, reason: &str) -> Flow {
-    match direct.try_send(ServerMessage::error(reason).encode()) {
-        Ok(()) => Flow::Continue,
-        Err(_) => Flow::Close,
-    }
+fn refuse(direct: &mpsc::Sender<Arc<str>>, reason: &str) {
+    deliver(direct, ServerMessage::error(reason));
 }
 
 async fn receive_loop(
     state: &AppState,
     room: &Arc<Room>,
     identity: &Identity,
+    connection_id: u64,
     mut stream: SplitStream<WebSocket>,
     direct: mpsc::Sender<Arc<str>>,
 ) {
     let mut limiter = RateLimiter::new();
     while let Some(Ok(message)) = stream.next().await {
-        let flow = match message {
+        match message {
             Message::Text(text) => {
-                handle_text(state, room, identity, &direct, &mut limiter, text.as_str()).await
+                handle_text(
+                    state,
+                    room,
+                    identity,
+                    connection_id,
+                    &direct,
+                    &mut limiter,
+                    text.as_str(),
+                )
+                .await;
             }
             Message::Binary(_) => refuse(&direct, "binary frames are not accepted"),
-            Message::Close(_) => Flow::Close,
-            Message::Ping(_) | Message::Pong(_) => Flow::Continue,
-        };
-        if matches!(flow, Flow::Close) {
-            break;
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => {}
         }
     }
 }
@@ -276,10 +306,11 @@ async fn handle_text(
     state: &AppState,
     room: &Arc<Room>,
     identity: &Identity,
+    connection_id: u64,
     direct: &mpsc::Sender<Arc<str>>,
     limiter: &mut RateLimiter,
     text: &str,
-) -> Flow {
+) {
     if !limiter.allow() {
         return refuse(direct, "rate limit exceeded");
     }
@@ -300,13 +331,7 @@ async fn handle_text(
                 .apply_op(&state.pool, &identity.actor, client_seq, &key, value.0)
                 .await
             {
-                Ok(seq) => {
-                    let ack = ServerMessage::Ack { client_seq, seq }.encode();
-                    match direct.try_send(ack) {
-                        Ok(()) => Flow::Continue,
-                        Err(_) => Flow::Close,
-                    }
-                }
+                Ok(seq) => deliver(direct, ServerMessage::Ack { client_seq, seq }),
                 Err(error) => refuse(direct, error.reason()),
             }
         }
@@ -318,13 +343,15 @@ async fn handle_text(
             if text.len() > MAX_PRESENCE_BYTES {
                 return refuse(direct, "presence too large");
             }
-            room.relay(&ServerMessage::Presence {
-                actor: identity.actor.clone(),
-                cursor,
-                selection,
-                viewport,
-            });
-            Flow::Continue
+            room.relay_excluding(
+                connection_id,
+                &ServerMessage::Presence {
+                    actor: identity.actor.clone(),
+                    cursor,
+                    selection,
+                    viewport,
+                },
+            );
         }
     }
 }

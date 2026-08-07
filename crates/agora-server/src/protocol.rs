@@ -59,6 +59,10 @@ pub enum ServerMessage {
     Snapshot {
         seq: i64,
         state: Value,
+        /// The caller's own actor id, so a client can tell itself apart in the
+        /// peer list, and its role, so it knows before an op is refused.
+        actor: String,
+        role: DocumentRole,
     },
     Op {
         seq: i64,
@@ -196,10 +200,18 @@ mod tests {
         let snapshot = ServerMessage::Snapshot {
             seq: 7,
             state: json!({"meta": {"name": "plan"}}),
+            actor: "user-1".to_string(),
+            role: DocumentRole::Edit,
         };
         assert_eq!(
             serde_json::from_str::<Value>(&snapshot.encode()).unwrap(),
-            json!({"type": "snapshot", "seq": 7, "state": {"meta": {"name": "plan"}}})
+            json!({
+                "type": "snapshot",
+                "seq": 7,
+                "state": {"meta": {"name": "plan"}},
+                "actor": "user-1",
+                "role": "edit"
+            })
         );
 
         let op = ServerMessage::Op {

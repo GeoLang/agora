@@ -62,12 +62,23 @@ impl RoomInner {
     }
 }
 
+/// A message on its way to every connection in a room.
+///
+/// `skip_connection` is set for presence, which never goes back to the peer that
+/// sent it. It is a connection and not an actor, so two tabs of one account
+/// still see each other.
+#[derive(Clone)]
+pub struct RoomEvent {
+    pub skip_connection: Option<u64>,
+    pub text: Arc<str>,
+}
+
 /// One document held in memory while at least one connection is on it. Every
 /// op for the document passes through [`Room::apply_op`], which is what makes
 /// the server the single order authority.
 pub struct Room {
     pub document_id: Uuid,
-    sender: broadcast::Sender<Arc<str>>,
+    sender: broadcast::Sender<RoomEvent>,
     inner: Mutex<RoomInner>,
 }
 
@@ -125,7 +136,19 @@ impl Room {
     /// far behind loses messages and is resynced with a snapshot, which is what
     /// keeps presence from queueing up behind a slow peer.
     pub fn relay(&self, message: &ServerMessage) {
-        let _ = self.sender.send(message.encode());
+        let _ = self.sender.send(RoomEvent {
+            skip_connection: None,
+            text: message.encode(),
+        });
+    }
+
+    /// Fan out to everyone except one connection, which is how presence reaches
+    /// the room without the sender being drawn its own cursor.
+    pub fn relay_excluding(&self, connection_id: u64, message: &ServerMessage) {
+        let _ = self.sender.send(RoomEvent {
+            skip_connection: Some(connection_id),
+            text: message.encode(),
+        });
     }
 
     /// Validate, order, persist, apply and fan out one op. Returns the seq the
@@ -240,7 +263,7 @@ impl Room {
 pub struct Joined {
     pub room: Arc<Room>,
     pub connection_id: u64,
-    pub receiver: broadcast::Receiver<Arc<str>>,
+    pub receiver: broadcast::Receiver<RoomEvent>,
     pub seq: i64,
     pub state: Value,
 }

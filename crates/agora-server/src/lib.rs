@@ -25,8 +25,11 @@ use crate::auth::AuthConfig;
 use crate::room::RoomRegistry;
 
 pub const DATABASE_URL_ENV: &str = "DATABASE_URL";
-pub const BIND_ENV: &str = "AGORA_BIND";
-pub const DEFAULT_BIND: &str = "0.0.0.0:8080";
+pub const PORT_ENV: &str = "PORT";
+
+/// Internal port the platform's nginx routes `/agora/` to, the same one
+/// interiora and geoplumb listen on.
+pub const DEFAULT_PORT: u16 = 3000;
 
 #[derive(Clone)]
 pub struct AppState {
