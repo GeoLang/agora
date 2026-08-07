@@ -16,6 +16,11 @@ pub const MAX_DOCUMENT_STATE_BYTES: usize = 4 * 1024 * 1024;
 /// Longest accepted document name, bytes.
 pub const MAX_DOCUMENT_NAME_BYTES: usize = 200;
 
+/// Longest accepted member user id, bytes. A user id is an opaque platform jwt
+/// subject and agora has no user directory, so a length bound is the only check
+/// there is.
+pub const MAX_USER_ID_BYTES: usize = 128;
+
 /// Hard websocket message limit. Anything larger closes the connection before
 /// it is buffered, so it never reaches the graceful per-field checks.
 pub const MAX_INBOUND_FRAME_BYTES: usize = 128 * 1024;

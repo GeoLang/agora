@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::FromRef;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use sqlx::PgPool;
 use sqlx::migrate::MigrateError;
 use tower_http::cors::CorsLayer;
@@ -67,6 +67,10 @@ pub fn router(state: AppState) -> Router {
             post(documents::create_document).get(documents::list_documents),
         )
         .route("/documents/{id}", get(documents::get_document))
+        .route(
+            "/documents/{id}/members/{user_id}",
+            put(documents::set_member).delete(documents::remove_member),
+        )
         .route("/documents/{id}/links", post(links::create_link))
         .route(
             "/links/{token}",

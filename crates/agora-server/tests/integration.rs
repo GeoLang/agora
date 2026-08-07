@@ -4,6 +4,7 @@ use agora_server::auth::{AuthConfig, share_token_hash};
 use agora_server::limits::{
     MAX_CLIENT_MESSAGES_PER_SECOND, MAX_DOCUMENT_NAME_BYTES, MAX_INBOUND_FRAME_BYTES,
     MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES,
+    MAX_USER_ID_BYTES,
 };
 use agora_server::protocol::Peer;
 use agora_server::role::DocumentRole;
@@ -111,6 +112,66 @@ async fn create_document(app: &TestApp, token: &str, name: &str) -> Uuid {
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok())
         .expect("a document id")
+}
+
+async fn set_member(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    user_id: &str,
+    role: &str,
+) -> reqwest::Response {
+    app.client
+        .put(format!(
+            "{}/documents/{document_id}/members/{user_id}",
+            app.http_base
+        ))
+        .bearer_auth(token)
+        .json(&json!({"role": role}))
+        .send()
+        .await
+        .expect("set member")
+}
+
+async fn remove_member(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    user_id: &str,
+) -> reqwest::Response {
+    app.client
+        .delete(format!(
+            "{}/documents/{document_id}/members/{user_id}",
+            app.http_base
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("remove member")
+}
+
+async fn member_roles(app: &TestApp, token: &str, document_id: Uuid) -> Vec<(String, String)> {
+    let detail: Value = app
+        .client
+        .get(format!("{}/documents/{document_id}", app.http_base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("detail")
+        .json()
+        .await
+        .expect("json");
+    detail["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .map(|member| {
+            (
+                member["userId"].as_str().expect("a user id").to_string(),
+                member["role"].as_str().expect("a role").to_string(),
+            )
+        })
+        .collect()
 }
 
 async fn mint_link(app: &TestApp, token: &str, document_id: Uuid, role: &str) -> String {
@@ -1453,4 +1514,251 @@ async fn only_an_editor_can_mint_or_revoke_a_share_link() {
 
     // the link still works, so none of the refused calls changed it
     assert_eq!(resolve_link(&app, &link).await["role"], "view");
+}
+
+#[tokio::test]
+async fn an_editor_adds_a_member_and_changes_their_role() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "shared work").await;
+
+    let invitee = fresh_user();
+    let invitee_token = platform_token(&invitee);
+    let before = app
+        .client
+        .get(format!("{}/documents/{document_id}", app.http_base))
+        .bearer_auth(&invitee_token)
+        .send()
+        .await
+        .expect("detail before joining");
+    assert_eq!(before.status(), 404);
+
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &invitee, "view")
+            .await
+            .status(),
+        204
+    );
+
+    let listed: Value = app
+        .client
+        .get(format!("{}/documents", app.http_base))
+        .bearer_auth(&invitee_token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    let listed = listed.as_array().expect("an array");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], document_id.to_string());
+    assert_eq!(listed[0]["role"], "view");
+
+    // a view member cannot mint a link, an edit member can, so the stored role
+    // is what actually decides
+    let minted = app
+        .client
+        .post(format!("{}/documents/{document_id}/links", app.http_base))
+        .bearer_auth(&invitee_token)
+        .json(&json!({"role": "view"}))
+        .send()
+        .await
+        .expect("mint as a view member");
+    assert_eq!(minted.status(), 403);
+
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &invitee, "edit")
+            .await
+            .status(),
+        204
+    );
+    let link = mint_link(&app, &invitee_token, document_id, "view").await;
+    assert_eq!(resolve_link(&app, &link).await["role"], "view");
+
+    // setting the same role again is the same operation, not a second member
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &invitee, "edit")
+            .await
+            .status(),
+        204
+    );
+    let mut roles = member_roles(&app, &owner_token, document_id).await;
+    roles.sort();
+    let mut expected = vec![
+        (owner.clone(), "edit".to_string()),
+        (invitee.clone(), "edit".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(roles, expected);
+
+    assert_eq!(
+        remove_member(&app, &owner_token, document_id, &invitee)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        member_roles(&app, &owner_token, document_id).await,
+        vec![(owner, "edit".to_string())]
+    );
+    let after = app
+        .client
+        .get(format!("{}/documents/{document_id}", app.http_base))
+        .bearer_auth(&invitee_token)
+        .send()
+        .await
+        .expect("detail after removal");
+    assert_eq!(after.status(), 404);
+}
+
+#[tokio::test]
+async fn only_an_editor_can_manage_members() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "member gate").await;
+
+    let reader = fresh_user();
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &reader, "view")
+            .await
+            .status(),
+        204
+    );
+    let reader_token = platform_token(&reader);
+    let stranger = fresh_user();
+    let stranger_token = platform_token(&stranger);
+    let session = guest_session(&app, &owner_token, document_id, "edit").await;
+    let target = fresh_user();
+
+    // a view member is told 403, a non member 404, so a document id cannot be
+    // probed with a membership call
+    for (caller, expected) in [
+        (&reader_token, 403),
+        (&stranger_token, 404),
+        (&session, 401),
+    ] {
+        assert_eq!(
+            set_member(&app, caller, document_id, &target, "edit")
+                .await
+                .status(),
+            expected
+        );
+        assert_eq!(
+            remove_member(&app, caller, document_id, &owner)
+                .await
+                .status(),
+            expected
+        );
+    }
+
+    let unauthenticated = app
+        .client
+        .put(format!(
+            "{}/documents/{document_id}/members/{target}",
+            app.http_base
+        ))
+        .json(&json!({"role": "edit"}))
+        .send()
+        .await
+        .expect("set with no token");
+    assert_eq!(unauthenticated.status(), 401);
+
+    let mut roles = member_roles(&app, &owner_token, document_id).await;
+    roles.sort();
+    let mut expected = vec![(owner, "edit".to_string()), (reader, "view".to_string())];
+    expected.sort();
+    assert_eq!(roles, expected, "a refused call changed the member list");
+}
+
+#[tokio::test]
+async fn the_last_editor_cannot_be_removed_or_demoted() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "sole editor").await;
+
+    let demoted = set_member(&app, &owner_token, document_id, &owner, "view").await;
+    assert_eq!(demoted.status(), 400);
+    let body: Value = demoted.json().await.expect("json");
+    assert_eq!(body["error"], "the last editor cannot be demoted");
+
+    let removed = remove_member(&app, &owner_token, document_id, &owner).await;
+    assert_eq!(removed.status(), 400);
+    let body: Value = removed.json().await.expect("json");
+    assert_eq!(body["error"], "the last editor cannot be removed");
+
+    // a view member is not a replacement, so the rule still holds
+    let reader = fresh_user();
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &reader, "view")
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        remove_member(&app, &owner_token, document_id, &owner)
+            .await
+            .status(),
+        400
+    );
+
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &reader, "edit")
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &owner, "view")
+            .await
+            .status(),
+        204,
+        "an editor could not step down with another editor left"
+    );
+
+    let reader_token = platform_token(&reader);
+    assert_eq!(
+        remove_member(&app, &reader_token, document_id, &owner)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        remove_member(&app, &reader_token, document_id, &reader)
+            .await
+            .status(),
+        400,
+        "the document was left with no editor"
+    );
+    assert_eq!(
+        member_roles(&app, &reader_token, document_id).await,
+        vec![(reader, "edit".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn a_membership_call_refuses_an_unusable_user_id() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "user id bounds").await;
+
+    let too_long = "a".repeat(MAX_USER_ID_BYTES + 1);
+    let refused = set_member(&app, &owner_token, document_id, &too_long, "view").await;
+    assert_eq!(refused.status(), 400);
+    let body: Value = refused.json().await.expect("json");
+    assert_eq!(body["error"], "invalid user id");
+
+    let at_the_cap = "a".repeat(MAX_USER_ID_BYTES);
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &at_the_cap, "view")
+            .await
+            .status(),
+        204
+    );
+
+    let never_a_member = remove_member(&app, &owner_token, document_id, &fresh_user()).await;
+    assert_eq!(never_a_member.status(), 404);
 }

@@ -50,6 +50,8 @@ Every route needs `Authorization: Bearer <platform jwt>` except `GET /health` an
 | `POST /documents` `{"name": "..."}` | Creates a document. The caller becomes its edit member. |
 | `GET /documents` | The caller's documents. |
 | `GET /documents/{id}` | Name, creation details and members. |
+| `PUT /documents/{id}/members/{userId}` `{"role": "view"\|"edit"}` | Adds a member or changes their role, edit role only. Idempotent. |
+| `DELETE /documents/{id}/members/{userId}` | Removes a member, edit role only. |
 | `POST /documents/{id}/links` `{"role": "view"\|"edit"}` | Mints a share link, edit role only. Returns `{"token": "..."}`. |
 | `DELETE /links/{token}` | Revokes a share link, edit role only. |
 | `GET /links/{token}` | Resolves a link to `{"doc": "...", "role": "...", "sessionToken": "..."}`. |
@@ -61,6 +63,15 @@ further links.
 
 A caller who cannot edit a document is told a link does not exist rather than
 that it is forbidden, so link tokens cannot be probed.
+
+There is no owner or admin role, so managing members needs the edit role and
+nothing more, which an editor could already hand out as an edit link. A document
+always keeps at least one edit member: removing or demoting the last editor is a
+400, including when an editor is acting on themself.
+
+A `userId` is a platform JWT subject. Agora has no user directory, so it is
+taken as given and only checked for length, and adding a member who never signs
+in costs nothing.
 
 ## Websocket
 
@@ -152,6 +163,7 @@ one is an `error` message or a 4xx, never a panic.
 | Client messages per connection | 60 per second, ops and presence together |
 | Peers per document | 32 |
 | Document name | 200 bytes |
+| Member user id | 128 bytes |
 | Document state | 4 MiB, measured as the sum over stored keys of the key length plus the JSON length of its value |
 
 Share link tokens are 128 random bits, url safe. Session tokens expire after 12
