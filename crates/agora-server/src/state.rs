@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use crate::limits::{MAX_DOCUMENT_NAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES};
 
 /// The only namespaces an op key may address.
-pub const NAMESPACES: [&str; 4] = ["meta", "layers", "annotations", "bookmarks"];
+pub const NAMESPACES: [&str; 5] = ["meta", "layers", "annotations", "bookmarks", "comments"];
 
 /// The one key the server reads rather than passes through.
 pub const META_NAME_KEY: &str = "meta/name";
@@ -192,6 +192,10 @@ mod tests {
             Ok(("annotations", "x-1_2.3"))
         );
         assert_eq!(parse_key("bookmarks/b"), Ok(("bookmarks", "b")));
+        assert_eq!(
+            parse_key("comments/018f2c1a-6d3b-7e42-9c10-5a8b7d2e4f16"),
+            Ok(("comments", "018f2c1a-6d3b-7e42-9c10-5a8b7d2e4f16"))
+        );
         for key in ["", "layers", "secrets/a", "Layers/a", "/a", "../a"] {
             assert_eq!(parse_key(key), Err(KeyError::UnknownNamespace), "{key:?}");
         }
@@ -232,7 +236,7 @@ mod tests {
         let state = DocumentState::new("plan");
         let snapshot = state.snapshot();
         assert_eq!(snapshot["meta"]["name"], json!("plan"));
-        for namespace in ["layers", "annotations", "bookmarks"] {
+        for namespace in ["layers", "annotations", "bookmarks", "comments"] {
             assert!(snapshot[namespace].is_object(), "{namespace}");
             assert_eq!(snapshot[namespace].as_object().unwrap().len(), 0);
         }

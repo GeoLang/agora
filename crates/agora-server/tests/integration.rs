@@ -500,7 +500,7 @@ async fn a_join_receives_a_snapshot_then_the_peer_list() {
     let snapshot = client.expect_message("snapshot").await;
     assert_eq!(snapshot["seq"], 0);
     assert_eq!(snapshot["state"]["meta"]["name"], "city plan");
-    for namespace in ["layers", "annotations", "bookmarks"] {
+    for namespace in ["layers", "annotations", "bookmarks", "comments"] {
         assert!(snapshot["state"][namespace].is_object(), "{namespace}");
     }
     // a client learns who it is and what it may do from the snapshot itself
@@ -989,6 +989,99 @@ async fn document_state_survives_a_restart_from_its_checkpoint_and_tail() {
     assert_eq!(layers["l0"]["order"], "a0000");
     assert_eq!(layers["l299"]["order"], "a0299");
     assert_eq!(snapshot["state"]["meta"]["name"], "checkpointed");
+}
+
+#[tokio::test]
+async fn comments_reach_the_snapshot_the_checkpoint_and_a_restart() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let token = platform_token(&owner);
+    let document_id = create_document(&app, &token, "commented").await;
+
+    let thread = "018f2c1a-6d3b-7e42-9c10-5a8b7d2e4f16";
+    let reply = "018f2c1a-6d3b-7e42-9c10-5a8b7d2e4f17";
+    let mut client = open(&app, document_id, &token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(
+        &mut client,
+        1,
+        &format!("comments/{thread}"),
+        json!({
+            "id": thread,
+            "actor": owner,
+            "authorName": "Ada",
+            "text": "is this the right coastline",
+            "createdAt": 10,
+            "resolved": false,
+            "anchor": {"lng": 12.5, "lat": -3.25, "zoom": 8}
+        }),
+    )
+    .await;
+    send_and_settle(
+        &mut client,
+        2,
+        &format!("comments/{reply}"),
+        json!({
+            "id": reply,
+            "actor": owner,
+            "authorName": "Ada",
+            "text": "checked, it is",
+            "createdAt": 20,
+            "parentId": thread
+        }),
+    )
+    .await;
+    client.close().await;
+
+    let snapshot = stored_document(&app, document_id, &token).await;
+    let comments = snapshot["state"]["comments"]
+        .as_object()
+        .expect("a comment map");
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[thread]["text"], "is this the right coastline");
+    assert_eq!(comments[thread]["anchor"]["lng"], 12.5);
+    assert_eq!(comments[reply]["parentId"], thread);
+
+    // fold a checkpoint over the comment ops, then prove it carried them
+    apply_ops_directly(&app, document_id, &owner, 300).await;
+    let checkpoint: Value = sqlx::query_scalar("select checkpoint from documents where id = $1")
+        .bind(document_id)
+        .fetch_one(&app.state.pool)
+        .await
+        .expect("read the checkpoint");
+    assert_eq!(checkpoint["comments"][thread]["createdAt"], 10);
+    assert_eq!(checkpoint["comments"][reply]["parentId"], thread);
+
+    let restarted = restart(&app).await;
+    let recovered = stored_document(&restarted, document_id, &token).await;
+    assert_eq!(
+        recovered["state"]["comments"][thread]["text"],
+        "is this the right coastline"
+    );
+
+    // resolve is last writer wins on the same key, and a null deletes it
+    let mut client = open(&restarted, document_id, &token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(
+        &mut client,
+        1,
+        &format!("comments/{thread}"),
+        json!({
+            "id": thread,
+            "actor": owner,
+            "authorName": "Ada",
+            "text": "is this the right coastline",
+            "createdAt": 10,
+            "resolved": true
+        }),
+    )
+    .await;
+    send_and_settle(&mut client, 2, &format!("comments/{reply}"), Value::Null).await;
+    client.close().await;
+
+    let settled = stored_document(&restarted, document_id, &token).await;
+    assert_eq!(settled["state"]["comments"][thread]["resolved"], true);
+    assert!(settled["state"]["comments"].get(reply).is_none());
 }
 
 #[tokio::test]

@@ -1,8 +1,8 @@
 # Agora
 
 Live multiplayer session service for GeoLang composition documents. A document
-is one JSON object holding map layers, annotations and bookmarks. Agora owns it,
-orders every edit, and fans the edits out to everyone looking at it.
+is one JSON object holding map layers, annotations, bookmarks and comments. Agora
+owns it, orders every edit, and fans the edits out to everyone looking at it.
 
 Single instance. The server assigns a sequence number to every op, and the last
 writer on a key wins.
@@ -31,14 +31,19 @@ variables come from the environment.
   "meta": {"name": "city plan"},
   "layers": {"roads": {"order": "a0", "...": "..."}},
   "annotations": {},
-  "bookmarks": {}
+  "bookmarks": {},
+  "comments": {}
 }
 ```
 
 A layer's `order` is a fractional index string, so a reorder is a write to one
-key rather than a rewrite of the list. Layer, annotation and bookmark values are
-opaque JSON to the server. Only `meta/name` has server meaning: it has to be a
-string within the name cap, and it also updates the document row.
+key rather than a rewrite of the list. Layer, annotation, bookmark and comment
+values are opaque JSON to the server. Only `meta/name` has server meaning: it has
+to be a string within the name cap, and it also updates the document row.
+
+A comment thread is flat: a reply is its own key carrying its parent's id, and
+the client groups them. The server enforces no authorship, so any editor can
+overwrite or delete any comment key.
 
 ## HTTP API
 
@@ -121,8 +126,8 @@ same as two separate ops. One `clientSeq` covers the batch and one `ack` answers
 it.
 
 Keys are `<namespace>/<id>` where the namespace is one of `meta`, `layers`,
-`annotations` or `bookmarks`, and the id is letters, digits, `-`, `_` or `.`.
-Anything else is refused.
+`annotations`, `bookmarks` or `comments`, and the id is letters, digits, `-`, `_`
+or `.`. Anything else is refused.
 
 ### Server to client
 
