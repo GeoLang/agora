@@ -6,6 +6,7 @@ pub mod documents;
 pub mod error;
 pub mod limits;
 pub mod links;
+pub mod notifications;
 pub mod protocol;
 pub mod role;
 pub mod room;
@@ -72,6 +73,11 @@ pub fn router(state: AppState) -> Router {
             put(documents::set_member).delete(documents::remove_member),
         )
         .route("/documents/{id}/links", post(links::create_link))
+        .route("/notifications", get(notifications::list_notifications))
+        .route(
+            "/notifications/read",
+            post(notifications::mark_notifications_read),
+        )
         .route(
             "/links/{token}",
             get(links::resolve_link).delete(links::revoke_link),

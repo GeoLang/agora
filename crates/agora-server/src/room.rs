@@ -11,6 +11,7 @@ use crate::limits::{
     CHECKPOINT_INTERVAL_OPS, MAX_DOCUMENT_STATE_BYTES, MAX_PEERS_PER_DOCUMENT,
     ROOM_BROADCAST_CAPACITY, oldest_op_to_keep,
 };
+use crate::notifications::record_comment_mentions;
 use crate::protocol::{AppliedOp, BatchOp, OpValue, Peer, ServerMessage};
 use crate::state::{
     DocumentState, KeyError, META_NAME_KEY, op_value_within_cap, parse_key, valid_document_name,
@@ -240,6 +241,9 @@ impl Room {
 
         let mut seq = inner.seq;
         let mut applied = Vec::with_capacity(ops.len());
+        // earlier writes in this batch, so a key written twice diffs against
+        // its in-batch predecessor rather than the stored value
+        let mut written: HashMap<&str, Option<&Value>> = HashMap::new();
         let mut transaction = pool.begin().await.map_err(BatchError::database)?;
         for op in ops {
             seq += 1;
@@ -256,6 +260,23 @@ impl Room {
             .execute(&mut *transaction)
             .await
             .map_err(BatchError::database)?;
+            if let Ok(("comments", comment_id)) = parse_key(&op.key) {
+                let previous = match written.get(op.key.as_str()) {
+                    Some(value) => *value,
+                    None => inner.state.value(&op.key),
+                };
+                record_comment_mentions(
+                    &mut transaction,
+                    self.document_id,
+                    comment_id,
+                    actor,
+                    previous,
+                    op.value.0.as_ref(),
+                )
+                .await
+                .map_err(BatchError::database)?;
+            }
+            written.insert(op.key.as_str(), op.value.0.as_ref());
             applied.push(AppliedOp {
                 seq,
                 key: op.key.clone(),

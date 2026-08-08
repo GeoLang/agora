@@ -2285,3 +2285,322 @@ async fn a_membership_call_refuses_an_unusable_user_id() {
     let never_a_member = remove_member(&app, &owner_token, document_id, &fresh_user()).await;
     assert_eq!(never_a_member.status(), 404);
 }
+
+async fn list_notifications(app: &TestApp, token: &str) -> Value {
+    let response = app
+        .client
+        .get(format!("{}/notifications", app.http_base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list notifications");
+    assert_eq!(response.status(), 200);
+    response.json().await.expect("json body")
+}
+
+async fn mark_notifications_read(app: &TestApp, token: &str, body: Value) -> u16 {
+    app.client
+        .post(format!("{}/notifications/read", app.http_base))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("mark notifications read")
+        .status()
+        .as_u16()
+}
+
+fn comment_mentioning(author_name: &str, text: &str, mentioned: &[&str]) -> Value {
+    let mentions: Vec<Value> = mentioned
+        .iter()
+        .map(|user_id| json!({"userId": user_id, "name": user_id}))
+        .collect();
+    json!({
+        "authorName": author_name,
+        "text": text,
+        "createdAt": 1,
+        "mentions": mentions
+    })
+}
+
+#[tokio::test]
+async fn a_mention_notifies_the_member_and_nobody_else() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let member = fresh_user();
+    let stranger = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "mention map").await;
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &member, "view")
+            .await
+            .status(),
+        204
+    );
+
+    let mut client = open(&app, document_id, &owner_token, None).await;
+    expect_join(&mut client).await;
+    // the member twice, the author and a non member: exactly one row comes out
+    let comment = comment_mentioning(
+        "Ada",
+        "look at @this spot",
+        &[&member, &member, &owner, &stranger],
+    );
+    send_and_settle(&mut client, 1, "comments/c1", comment).await;
+    client.close().await;
+
+    let notified = list_notifications(&app, &platform_token(&member)).await;
+    let entries = notified.as_array().expect("an array");
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["docId"], document_id.to_string());
+    assert_eq!(entry["docName"], "mention map");
+    assert_eq!(entry["commentId"], "c1");
+    assert_eq!(entry["authorName"], "Ada");
+    assert_eq!(entry["excerpt"], "look at @this spot");
+    assert!(entry["readAt"].is_null());
+    assert!(entry["createdAt"].is_string());
+
+    for uninvolved in [&owner, &stranger] {
+        let empty = list_notifications(&app, &platform_token(uninvolved)).await;
+        assert_eq!(empty.as_array().expect("an array").len(), 0, "{uninvolved}");
+    }
+}
+
+#[tokio::test]
+async fn a_rewrite_only_notifies_the_mentions_it_adds() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let first = fresh_user();
+    let second = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "resolve map").await;
+    for member in [&first, &second] {
+        assert_eq!(
+            set_member(&app, &owner_token, document_id, member, "edit")
+                .await
+                .status(),
+            204
+        );
+    }
+
+    let mut client = open(&app, document_id, &owner_token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(
+        &mut client,
+        1,
+        "comments/c1",
+        comment_mentioning("Ada", "first pass", &[&first]),
+    )
+    .await;
+
+    // the resolve rewrite keeps the mention list, so nobody is pinged again
+    let mut resolved = comment_mentioning("Ada", "first pass", &[&first]);
+    resolved["resolved"] = json!(true);
+    send_and_settle(&mut client, 2, "comments/c1", resolved).await;
+    let first_entries = list_notifications(&app, &platform_token(&first)).await;
+    assert_eq!(first_entries.as_array().expect("an array").len(), 1);
+
+    let widened = comment_mentioning("Ada", "second pass", &[&first, &second]);
+    send_and_settle(&mut client, 3, "comments/c1", widened).await;
+    client.close().await;
+
+    let first_entries = list_notifications(&app, &platform_token(&first)).await;
+    assert_eq!(first_entries.as_array().expect("an array").len(), 1);
+    let second_entries = list_notifications(&app, &platform_token(&second)).await;
+    let second_entries = second_entries.as_array().expect("an array");
+    assert_eq!(second_entries.len(), 1);
+    assert_eq!(second_entries[0]["excerpt"], "second pass");
+}
+
+#[tokio::test]
+async fn deleting_a_comment_clears_only_its_unread_notifications() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let member = fresh_user();
+    let owner_token = platform_token(&owner);
+    let member_token = platform_token(&member);
+    let document_id = create_document(&app, &owner_token, "delete map").await;
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &member, "view")
+            .await
+            .status(),
+        204
+    );
+
+    let mut client = open(&app, document_id, &owner_token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(
+        &mut client,
+        1,
+        "comments/kept",
+        comment_mentioning("Ada", "kept and read", &[&member]),
+    )
+    .await;
+    assert_eq!(
+        mark_notifications_read(&app, &member_token, json!({})).await,
+        204
+    );
+    send_and_settle(
+        &mut client,
+        2,
+        "comments/dropped",
+        comment_mentioning("Ada", "dropped unread", &[&member]),
+    )
+    .await;
+
+    send_and_settle(&mut client, 3, "comments/kept", Value::Null).await;
+    send_and_settle(&mut client, 4, "comments/dropped", Value::Null).await;
+    client.close().await;
+
+    let entries = list_notifications(&app, &member_token).await;
+    let entries = entries.as_array().expect("an array");
+    assert_eq!(entries.len(), 1, "only the read notification survives");
+    assert_eq!(entries[0]["commentId"], "kept");
+    assert!(entries[0]["readAt"].is_string());
+}
+
+#[tokio::test]
+async fn marking_read_is_scoped_to_the_caller_and_the_ids_given() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let first = fresh_user();
+    let second = fresh_user();
+    let owner_token = platform_token(&owner);
+    let first_token = platform_token(&first);
+    let document_id = create_document(&app, &owner_token, "read map").await;
+    for member in [&first, &second] {
+        assert_eq!(
+            set_member(&app, &owner_token, document_id, member, "view")
+                .await
+                .status(),
+            204
+        );
+    }
+
+    let mut client = open(&app, document_id, &owner_token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(
+        &mut client,
+        1,
+        "comments/c1",
+        comment_mentioning("Ada", "both of you", &[&first, &second]),
+    )
+    .await;
+    send_and_settle(
+        &mut client,
+        2,
+        "comments/c2",
+        comment_mentioning("Ada", "again", &[&first]),
+    )
+    .await;
+    client.close().await;
+
+    let entries = list_notifications(&app, &first_token).await;
+    let entries = entries.as_array().expect("an array");
+    assert_eq!(entries.len(), 2);
+    let one_id = entries[0]["id"].as_str().expect("an id").to_string();
+
+    assert_eq!(
+        mark_notifications_read(&app, &first_token, json!({"ids": [one_id]})).await,
+        204
+    );
+    let after_one = list_notifications(&app, &first_token).await;
+    let unread: Vec<&Value> = after_one
+        .as_array()
+        .expect("an array")
+        .iter()
+        .filter(|entry| entry["readAt"].is_null())
+        .collect();
+    assert_eq!(unread.len(), 1);
+
+    assert_eq!(
+        mark_notifications_read(&app, &first_token, json!({})).await,
+        204
+    );
+    let after_all = list_notifications(&app, &first_token).await;
+    assert!(
+        after_all
+            .as_array()
+            .expect("an array")
+            .iter()
+            .all(|entry| entry["readAt"].is_string())
+    );
+
+    let second_entries = list_notifications(&app, &platform_token(&second)).await;
+    let second_entries = second_entries.as_array().expect("an array");
+    assert_eq!(second_entries.len(), 1);
+    assert!(
+        second_entries[0]["readAt"].is_null(),
+        "another member's marking must not touch these"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_member_removes_their_notifications_for_that_document() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let member = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "removal map").await;
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &member, "view")
+            .await
+            .status(),
+        204
+    );
+
+    let mut client = open(&app, document_id, &owner_token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(
+        &mut client,
+        1,
+        "comments/c1",
+        comment_mentioning("Ada", "before removal", &[&member]),
+    )
+    .await;
+    client.close().await;
+
+    assert_eq!(
+        remove_member(&app, &owner_token, document_id, &member)
+            .await
+            .status(),
+        204
+    );
+    let entries = list_notifications(&app, &platform_token(&member)).await;
+    assert_eq!(entries.as_array().expect("an array").len(), 0);
+}
+
+#[tokio::test]
+async fn a_guest_mention_notifies_a_member_but_a_guest_cannot_list() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "guest map").await;
+    let session_token = guest_session(&app, &owner_token, document_id, "edit").await;
+
+    let mut guest = open(&app, document_id, &session_token, None).await;
+    expect_join(&mut guest).await;
+    send_and_settle(
+        &mut guest,
+        1,
+        "comments/c1",
+        comment_mentioning("guest", "a guest pings the owner", &[&owner]),
+    )
+    .await;
+    guest.close().await;
+
+    let entries = list_notifications(&app, &owner_token).await;
+    let entries = entries.as_array().expect("an array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["authorName"], "guest");
+
+    let refused = app
+        .client
+        .get(format!("{}/notifications", app.http_base))
+        .bearer_auth(&session_token)
+        .send()
+        .await
+        .expect("guest list attempt");
+    assert_eq!(refused.status(), 401);
+}

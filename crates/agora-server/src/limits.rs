@@ -48,6 +48,13 @@ pub const SESSION_TOKEN_LIFETIME_HOURS: i64 = 12;
 /// Entropy in a share link token, bytes.
 pub const SHARE_TOKEN_BYTES: usize = 16;
 
+/// Notifications one list call returns, newest first.
+pub const NOTIFICATIONS_PAGE_SIZE: i64 = 50;
+
+/// Characters of a comment's text and author name carried into its
+/// notifications.
+pub const NOTIFICATION_EXCERPT_CHARS: usize = 160;
+
 /// Room fan out buffer. A connection that falls this far behind is resynced
 /// with a fresh snapshot rather than dropped.
 pub const ROOM_BROADCAST_CAPACITY: usize = 256;

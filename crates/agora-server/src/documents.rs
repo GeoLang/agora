@@ -296,6 +296,11 @@ pub async fn remove_member(
     if removed == 0 {
         return Err(ApiError::not_found("no such member"));
     }
+    sqlx::query("delete from notifications where doc_id = $1 and user_id = $2")
+        .bind(document_id)
+        .bind(&user_id)
+        .execute(&mut *transaction)
+        .await?;
     transaction.commit().await?;
 
     Ok(StatusCode::NO_CONTENT)

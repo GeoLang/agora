@@ -45,6 +45,14 @@ A comment thread is flat: a reply is its own key carrying its parent's id, and
 the client groups them. The server enforces no authorship, so any editor can
 overwrite or delete any comment key.
 
+One exception to comment opacity: a comment value's `mentions` array of
+`{"userId": "..."}` entries is read on write. Each user id that is a current
+member of the document, was not in the key's previous value and is not the
+writer gets a notification row, on the op's own transaction. Deleting a comment
+deletes its unread notifications, and removing a member deletes their
+notifications for that document. Notifications are served by `GET
+/notifications`, so a member with no open socket finds out by polling.
+
 ## HTTP API
 
 Every route needs `Authorization: Bearer <platform jwt>` except `GET /health` and
@@ -60,6 +68,8 @@ Every route needs `Authorization: Bearer <platform jwt>` except `GET /health` an
 | `POST /documents/{id}/links` `{"role": "view"\|"edit"}` | Mints a share link, edit role only. Returns `{"token": "..."}`. |
 | `DELETE /links/{token}` | Revokes a share link, edit role only. |
 | `GET /links/{token}` | Resolves a link to `{"doc": "...", "role": "...", "sessionToken": "..."}`. |
+| `GET /notifications` | The caller's latest mention notifications, newest first. |
+| `POST /notifications/read` `{"ids": ["..."]}` | Marks the caller's notifications read, every unread one when `ids` is absent. |
 
 `sessionToken` is a short lived HS256 JWT carrying the document, the role and a
 random anonymous actor id. It is not a platform token and is refused everywhere a

@@ -169,6 +169,10 @@ impl DocumentState {
         }
     }
 
+    pub fn value(&self, key: &str) -> Option<&Value> {
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
     pub fn name(&self) -> Option<&str> {
         self.entries
             .get(META_NAME_KEY)
