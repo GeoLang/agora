@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use agora_server::auth::{AuthConfig, capability_token_hash};
 use agora_server::limits::{
-    MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND, MAX_DOCUMENT_NAME_BYTES,
-    MAX_DOCUMENT_STATE_BYTES, MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES,
-    MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
+    ATTACHMENT_GRACE_DAYS, MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND,
+    MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES,
+    MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
 };
 use agora_server::protocol::{BatchOp, OpValue, Peer};
 use agora_server::role::DocumentRole;
@@ -2949,4 +2949,128 @@ async fn deleting_a_document_deletes_its_attachments() {
         .await
         .expect("read a deleted attachment");
     assert_eq!(gone.status(), 404);
+}
+
+/// Point a layer at an attachment, the way an image overlay carries its bitmap.
+async fn reference_attachment(app: &TestApp, token: &str, document_id: Uuid, url: &str) {
+    let mut client = open(app, document_id, token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(&mut client, 1, "layers/overlay", json!({"image": url})).await;
+    client.close().await;
+}
+
+async fn unreference_attachment(app: &TestApp, token: &str, document_id: Uuid) {
+    let mut client = open(app, document_id, token, None).await;
+    expect_join(&mut client).await;
+    send_and_settle(&mut client, 2, "layers/overlay", Value::Null).await;
+    client.close().await;
+}
+
+/// Move the liveness stamp into the past, which is how a test reaches the grace
+/// period without waiting a week.
+async fn age_attachments(app: &TestApp, document_id: Uuid, days: i64) {
+    let stamp = time::OffsetDateTime::now_utc() - time::Duration::days(days);
+    sqlx::query("update attachments set last_referenced_at = $2 where doc_id = $1")
+        .bind(document_id)
+        .bind(stamp)
+        .execute(&app.state.pool)
+        .await
+        .expect("age attachments");
+}
+
+async fn last_referenced(app: &TestApp, document_id: Uuid) -> Option<time::OffsetDateTime> {
+    sqlx::query_scalar("select last_referenced_at from attachments where doc_id = $1")
+        .bind(document_id)
+        .fetch_optional(&app.state.pool)
+        .await
+        .expect("read the liveness stamp")
+}
+
+async fn sweep(app: &TestApp) {
+    agora_server::attachments::sweep(&app.state.pool)
+        .await
+        .expect("sweep");
+}
+
+#[tokio::test]
+async fn an_attachment_the_document_points_at_survives_the_sweep() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "referenced attachment").await;
+    let created = upload_png(&app, &owner_token, document_id).await;
+    let url = created["url"].as_str().expect("a url").to_string();
+    reference_attachment(&app, &owner_token, document_id, &url).await;
+
+    age_attachments(&app, document_id, ATTACHMENT_GRACE_DAYS + 1).await;
+    sweep(&app).await;
+
+    assert_eq!(attachment_rows(&app, document_id).await.len(), 1);
+    let read = app
+        .client
+        .get(format!("{}{url}", app.http_base))
+        .send()
+        .await
+        .expect("read a referenced attachment");
+    assert_eq!(read.status(), 200);
+
+    // the sweep found the reference and put the grace period back
+    let stamp = last_referenced(&app, document_id).await.expect("a stamp");
+    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(ATTACHMENT_GRACE_DAYS);
+    assert!(stamp > cutoff, "the stamp was left at {stamp}");
+}
+
+#[tokio::test]
+async fn an_attachment_nothing_points_at_dies_once_the_grace_period_runs_out() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "orphaned attachment").await;
+    let created = upload_png(&app, &owner_token, document_id).await;
+    let url = created["url"].as_str().expect("a url").to_string();
+    reference_attachment(&app, &owner_token, document_id, &url).await;
+    unreference_attachment(&app, &owner_token, document_id).await;
+
+    age_attachments(&app, document_id, ATTACHMENT_GRACE_DAYS - 1).await;
+    sweep(&app).await;
+    assert_eq!(
+        attachment_rows(&app, document_id).await.len(),
+        1,
+        "swept inside the grace period"
+    );
+
+    age_attachments(&app, document_id, ATTACHMENT_GRACE_DAYS + 1).await;
+    sweep(&app).await;
+    assert!(attachment_rows(&app, document_id).await.is_empty());
+
+    let gone = app
+        .client
+        .get(format!("{}{url}", app.http_base))
+        .send()
+        .await
+        .expect("read a swept attachment");
+    assert_eq!(gone.status(), 404);
+}
+
+#[tokio::test]
+async fn a_fresh_upload_survives_the_sweep_before_anything_points_at_it() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "unreferenced upload").await;
+    let created = upload_png(&app, &owner_token, document_id).await;
+
+    // the op carrying the url has not been written yet, which is the window the
+    // upload's own stamp covers
+    sweep(&app).await;
+
+    assert_eq!(attachment_rows(&app, document_id).await.len(), 1);
+    let read = app
+        .client
+        .get(format!(
+            "{}{}",
+            app.http_base,
+            created["url"].as_str().expect("a url")
+        ))
+        .send()
+        .await
+        .expect("read a fresh attachment");
+    assert_eq!(read.status(), 200);
 }

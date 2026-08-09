@@ -56,6 +56,15 @@ pub const SHARE_TOKEN_BYTES: usize = 16;
 /// there is nothing else to check on the read.
 pub const ATTACHMENT_TOKEN_BYTES: usize = 32;
 
+/// How long an attachment nothing points at survives. It has to outlive both a
+/// live session's undo stack, which is per session and cleared when the session
+/// leaves, and the reconnect tail, since either can put the reference back. A
+/// week of orphaned blobs costs nothing.
+pub const ATTACHMENT_GRACE_DAYS: i64 = 7;
+
+/// How often the sweep looks for attachments nothing points at.
+pub const ATTACHMENT_SWEEP_INTERVAL_HOURS: u64 = 6;
+
 /// Notifications one list call returns, newest first.
 pub const NOTIFICATIONS_PAGE_SIZE: i64 = 50;
 

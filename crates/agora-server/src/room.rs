@@ -118,35 +118,10 @@ pub struct Room {
 
 impl Room {
     async fn load(pool: &PgPool, document_id: Uuid) -> Result<Self, JoinError> {
-        let row = sqlx::query("select checkpoint, checkpoint_seq from documents where id = $1")
-            .bind(document_id)
-            .fetch_optional(pool)
+        let (state, seq) = current_state(pool, document_id)
             .await
             .map_err(JoinError::Database)?
             .ok_or(JoinError::DocumentNotFound)?;
-        let checkpoint: Value = row.try_get("checkpoint").map_err(JoinError::Database)?;
-        let checkpoint_seq: i64 = row.try_get("checkpoint_seq").map_err(JoinError::Database)?;
-
-        let mut state = DocumentState::from_checkpoint(&checkpoint);
-        let tail = sqlx::query(
-            "select seq, key, value from ops where doc_id = $1 and seq > $2 order by seq",
-        )
-        .bind(document_id)
-        .bind(checkpoint_seq)
-        .fetch_all(pool)
-        .await
-        .map_err(JoinError::Database)?;
-
-        let mut seq = checkpoint_seq;
-        for row in tail {
-            let op_seq: i64 = row.try_get("seq").map_err(JoinError::Database)?;
-            let key: String = row.try_get("key").map_err(JoinError::Database)?;
-            let value: Option<Value> = row.try_get("value").map_err(JoinError::Database)?;
-            if parse_key(&key).is_ok() {
-                state.apply(&key, value);
-            }
-            seq = op_seq;
-        }
 
         let (sender, _) = broadcast::channel(ROOM_BROADCAST_CAPACITY);
         Ok(Self {
@@ -475,6 +450,47 @@ impl Default for RoomRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A document as a joining client would see it: the stored checkpoint with
+/// every op after it applied, and the seq that leaves it at. `None` when there
+/// is no such document.
+///
+/// Read from the database rather than from a live room, so a caller outside the
+/// room registry sees the same document a join would build.
+pub async fn current_state(
+    pool: &PgPool,
+    document_id: Uuid,
+) -> Result<Option<(DocumentState, i64)>, sqlx::Error> {
+    let Some(row) = sqlx::query("select checkpoint, checkpoint_seq from documents where id = $1")
+        .bind(document_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let checkpoint: Value = row.try_get("checkpoint")?;
+    let checkpoint_seq: i64 = row.try_get("checkpoint_seq")?;
+
+    let mut state = DocumentState::from_checkpoint(&checkpoint);
+    let tail =
+        sqlx::query("select seq, key, value from ops where doc_id = $1 and seq > $2 order by seq")
+            .bind(document_id)
+            .bind(checkpoint_seq)
+            .fetch_all(pool)
+            .await?;
+
+    let mut seq = checkpoint_seq;
+    for row in tail {
+        let op_seq: i64 = row.try_get("seq")?;
+        let key: String = row.try_get("key")?;
+        let value: Option<Value> = row.try_get("value")?;
+        if parse_key(&key).is_ok() {
+            state.apply(&key, value);
+        }
+        seq = op_seq;
+    }
+    Ok(Some((state, seq)))
 }
 
 /// The lowest op seq still stored for a document, or `None` once every op has

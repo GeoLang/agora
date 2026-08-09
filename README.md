@@ -122,6 +122,32 @@ editor's code running on the platform origin. Reads also carry
 
 Nothing caps how many attachments a document holds.
 
+### Expiry
+
+There is no delete route. A client driven delete would fight per user undo and
+the reconnect tail, either of which can put back an entry that points at the
+attachment. Instead a sweep decides liveness from the document itself: an
+attachment is live while the document's current state, the same state a joining
+client is sent, carries its url. Being pointed at refreshes it, and going seven
+days unpointed at deletes it.
+
+Keep the url the upload returned in the value. The sweep looks for
+`/attachments/<token>` anywhere in the serialized state, so an absolute url
+containing it counts too, but a value holding the bare token does not.
+
+Seven days because the grace period has to outlive anything that can restore a
+reference: a session's undo stack, which is per session and cleared when the
+session leaves, and the reconnect tail. A week of orphaned blobs costs nothing.
+
+Reading an attachment deliberately does not refresh it. Reads are cached as
+immutable, so agora never sees most of them and read driven liveness would call
+a live attachment dead.
+
+The sweep runs every six hours, and only looks at documents holding an
+attachment that is already past its grace period, so a document with no
+attachments and a document whose attachments were confirmed recently both cost
+nothing.
+
 ## Websocket
 
 `GET /ws?doc=<id>` and optionally `&since=<seq>`.

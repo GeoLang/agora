@@ -4,6 +4,16 @@
 
 ### Added
 
+- 2026-08-09: **attachments expire once nothing points at them**. Attachments
+  carry a `last_referenced_at` stamp (migration 006), set when they are uploaded
+  and refreshed by a sweep that finds the attachment's url in the document's
+  current state. Seven days unpointed at and the row goes. The sweep runs every
+  six hours and only looks at documents holding an attachment already past its
+  grace period, so a document with no attachments costs nothing. There is still
+  no delete route: a client driven delete would fight undo and the reconnect
+  tail. Reading an attachment does not refresh it, since reads are cached as
+  immutable and agora never sees most of them.
+
 - 2026-08-09: **document attachments**. `POST /documents/{id}/attachments`
   stores one image against a document, edit role only, raw body up to 16 MiB
   with the content type from the header. It answers `{"token", "url"}`, and

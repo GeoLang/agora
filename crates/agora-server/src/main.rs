@@ -1,3 +1,4 @@
+use agora_server::attachments::sweep_periodically;
 use agora_server::auth::AuthConfig;
 use agora_server::{
     AppState, DATABASE_URL_ENV, DEFAULT_PORT, PORT_ENV, connect_pool, migrate, router,
@@ -22,6 +23,8 @@ async fn start() -> Result<(), String> {
     migrate(&pool)
         .await
         .map_err(|error| format!("could not apply migrations: {error}"))?;
+
+    tokio::spawn(sweep_periodically(pool.clone()));
 
     let port = match std::env::var(PORT_ENV) {
         Ok(value) => value
