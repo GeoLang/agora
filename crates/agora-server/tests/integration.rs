@@ -376,26 +376,34 @@ fn batch_op(key: &str, value: Value) -> Value {
     json!({"key": key, "value": value})
 }
 
-/// Send a batch and read until its ack, which is the last thing it produces for
-/// the sender. Returns the seq of its last op.
+/// Send a batch and settle it: read until both the ack and the sender's own
+/// echo have arrived, since the two race each other. A batch of one op echoes
+/// as an `op` frame, a bigger one as a `batch` frame. Returns the seq of the
+/// last op.
 async fn send_batch_and_settle(
     client: &mut WebsocketClient,
     client_seq: i64,
     ops: Vec<Value>,
 ) -> i64 {
     client.send_batch(client_seq, ops).await;
+    let mut acked = None;
+    let mut echoed = false;
     for _ in 0..8 {
         let message = client.next_message().await;
         match message["type"].as_str() {
             Some("ack") => {
                 assert_eq!(message["clientSeq"], client_seq);
-                return message["seq"].as_i64().expect("a seq");
+                acked = message["seq"].as_i64();
             }
-            Some("op") | Some("batch") | Some("peers") => continue,
+            Some("op") | Some("batch") => echoed = true,
+            Some("peers") => {}
             _ => panic!("unexpected message {message}"),
         }
+        if let (Some(seq), true) = (acked, echoed) {
+            return seq;
+        }
     }
-    panic!("batch {client_seq} was never acked")
+    panic!("batch {client_seq} was never settled")
 }
 
 /// Send a batch that should be refused and return the reason given.
