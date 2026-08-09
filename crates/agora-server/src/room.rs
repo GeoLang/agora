@@ -212,8 +212,8 @@ impl Room {
     /// allowed and settle last writer wins, the same as two separate ops would.
     ///
     /// The ops take consecutive seqs, one row each, because the `ops` table is
-    /// keyed by them. What a batch buys is the single relayed frame, so peers
-    /// apply the whole group or none of it.
+    /// keyed by them. Every row also carries the seq of the frame's first op as
+    /// its `batch_seq`, which is what lets a replay hand back the same frame.
     ///
     /// An empty batch is refused before this, in the websocket handler.
     pub async fn apply_batch(
@@ -240,6 +240,7 @@ impl Room {
         }
 
         let mut seq = inner.seq;
+        let batch_seq = seq + 1;
         let mut applied = Vec::with_capacity(ops.len());
         // earlier writes in this batch, so a key written twice diffs against
         // its in-batch predecessor rather than the stored value
@@ -248,8 +249,8 @@ impl Room {
         for op in ops {
             seq += 1;
             sqlx::query(
-                "insert into ops (doc_id, seq, actor, key, value, client_seq)
-                 values ($1, $2, $3, $4, $5, $6)",
+                "insert into ops (doc_id, seq, actor, key, value, client_seq, batch_seq)
+                 values ($1, $2, $3, $4, $5, $6, $7)",
             )
             .bind(self.document_id)
             .bind(seq)
@@ -257,6 +258,7 @@ impl Room {
             .bind(&op.key)
             .bind(&op.value.0)
             .bind(client_seq)
+            .bind(batch_seq)
             .execute(&mut *transaction)
             .await
             .map_err(BatchError::database)?;
@@ -488,6 +490,9 @@ pub async fn oldest_retained_op(
     row.try_get::<Option<i64>, _>("oldest")
 }
 
+/// The ops after `after` and up to `through`, as the frames they were applied
+/// in: rows sharing a `batch_seq` come back as the one batch they went out as
+/// live, so a resuming client never sees a batch torn into single ops.
 pub async fn ops_between(
     pool: &PgPool,
     document_id: Uuid,
@@ -495,7 +500,7 @@ pub async fn ops_between(
     through: i64,
 ) -> Result<Vec<ServerMessage>, sqlx::Error> {
     let rows = sqlx::query(
-        "select seq, actor, key, value from ops
+        "select seq, actor, key, value, batch_seq from ops
          where doc_id = $1 and seq > $2 and seq <= $3 order by seq",
     )
     .bind(document_id)
@@ -504,14 +509,31 @@ pub async fn ops_between(
     .fetch_all(pool)
     .await?;
 
-    let mut messages = Vec::with_capacity(rows.len());
+    let mut messages = Vec::new();
+    let mut frame: Option<(i64, String, Vec<AppliedOp>)> = None;
     for row in rows {
-        messages.push(ServerMessage::Op {
+        let batch_seq: i64 = row.try_get("batch_seq")?;
+        let actor: String = row.try_get("actor")?;
+        let op = AppliedOp {
             seq: row.try_get("seq")?,
-            actor: row.try_get("actor")?,
             key: row.try_get("key")?,
             value: row.try_get("value")?,
-        });
+        };
+        match frame.take() {
+            Some((open_seq, open_actor, mut ops)) if open_seq == batch_seq => {
+                ops.push(op);
+                frame = Some((open_seq, open_actor, ops));
+            }
+            closed => {
+                if let Some((_, closed_actor, ops)) = closed {
+                    messages.push(relay_frame(&closed_actor, ops));
+                }
+                frame = Some((batch_seq, actor, vec![op]));
+            }
+        }
+    }
+    if let Some((_, actor, ops)) = frame {
+        messages.push(relay_frame(&actor, ops));
     }
     Ok(messages)
 }

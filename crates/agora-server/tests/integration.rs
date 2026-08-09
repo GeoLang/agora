@@ -920,6 +920,63 @@ async fn a_reconnect_with_since_replays_only_the_missed_ops() {
 }
 
 #[tokio::test]
+async fn a_reconnect_replays_a_batch_as_the_one_frame_it_was_applied_in() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let token = platform_token(&owner);
+    let document_id = create_document(&app, &token, "batch replay").await;
+
+    let mut client = open(&app, document_id, &token, None).await;
+    expect_join(&mut client).await;
+    assert_eq!(
+        send_and_settle(&mut client, 1, "layers/first", json!({"order": "a0"})).await,
+        1
+    );
+    assert_eq!(
+        send_batch_and_settle(
+            &mut client,
+            2,
+            vec![
+                batch_op("layers/a", json!({"order": "a1"})),
+                batch_op("layers/b", json!({"order": "a2"})),
+            ],
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        send_and_settle(&mut client, 3, "layers/last", json!({"order": "a3"})).await,
+        4
+    );
+    client.close().await;
+
+    let mut reconnected = open(&app, document_id, &token, Some(0)).await;
+    let first = reconnected.expect_message("op").await;
+    assert_eq!(first["seq"], 1);
+    assert_eq!(first["key"], "layers/first");
+
+    let replayed = reconnected.expect_message("batch").await;
+    assert_eq!(replayed["actor"], owner.as_str());
+    assert_eq!(
+        replayed["ops"],
+        json!([
+            {"seq": 2, "key": "layers/a", "value": {"order": "a1"}},
+            {"seq": 3, "key": "layers/b", "value": {"order": "a2"}},
+        ]),
+        "the batch was replayed torn"
+    );
+
+    let last = reconnected.expect_message("op").await;
+    assert_eq!(last["seq"], 4);
+    assert_eq!(last["key"], "layers/last");
+    reconnected.expect_message("peers").await;
+    assert!(
+        reconnected.try_next_message().await.is_none(),
+        "a replay sent more than the gap"
+    );
+}
+
+#[tokio::test]
 async fn a_since_older_than_the_retained_tail_falls_back_to_a_snapshot() {
     let app = spawn_app().await;
     let token = platform_token(&fresh_user());

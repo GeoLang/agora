@@ -62,8 +62,7 @@ pub enum ClientMessage {
 }
 
 /// One op the server has ordered, as it appears inside a relayed batch. Each
-/// carries its own seq, so a batch decomposes into exactly the `op` frames a
-/// reconnect would replay.
+/// carries its own seq, and a reconnect replays the batch as the same frame.
 #[derive(Debug, Clone, Serialize)]
 pub struct AppliedOp {
     pub seq: i64,

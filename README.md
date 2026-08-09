@@ -161,9 +161,8 @@ which is what keeps two tabs of one account in step.
 A batch takes one seq per op, so `batch` carries the same ops an `op` frame would
 and only groups them. Apply them in the order given and treat the last seq as the
 one reached. A batch of a single op relays as an `op`, since there is nothing to
-hold together. A reconnect with `since` replays a batch as separate `op` frames,
-which is a visible catch up rather than a live edit, and the state it arrives at
-is the same.
+hold together. A reconnect with `since` replays a batch as the same `batch`
+frame it went out as live, so a client catching up never sees one torn.
 
 A connection that falls far enough behind to lose messages is sent a fresh
 `snapshot` instead of the ops it missed, so presence traffic can be dropped under
