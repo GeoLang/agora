@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::limits::{SESSION_TOKEN_LIFETIME_HOURS, SHARE_TOKEN_BYTES};
+use crate::limits::SESSION_TOKEN_LIFETIME_HOURS;
 use crate::role::DocumentRole;
 
 /// Env var holding the shared HS256 secret.
@@ -151,22 +151,23 @@ impl AuthConfig {
     }
 }
 
-/// A share link token. 128 bits from the OS backed thread rng, url safe so it
-/// can sit in a link a person pastes.
-pub fn random_share_token() -> String {
-    let mut bytes = [0u8; SHARE_TOKEN_BYTES];
-    rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+/// A token that is itself the permission to reach something: a share link or an
+/// attachment. Entropy from the OS backed thread rng, url safe so it can sit in
+/// a link a person pastes.
+pub fn random_capability_token(entropy_bytes: usize) -> String {
+    let mut token = vec![0u8; entropy_bytes];
+    rng().fill_bytes(&mut token);
+    URL_SAFE_NO_PAD.encode(token)
 }
 
-/// The only form of a share link token the database ever holds, so a database
-/// read hands over no working link.
+/// The only form of a capability token the database ever holds, so a database
+/// read hands over no working link and no working attachment url.
 ///
-/// A plain digest and no salt on purpose: the token is 128 bits of csprng
-/// output, so there is no guessing surface for a password style kdf to defend,
-/// and a per row salt would cost the indexed equality lookup every consumer
-/// depends on.
-pub fn share_token_hash(token: &str) -> String {
+/// A plain digest and no salt on purpose: the token is 128 bits or more of
+/// csprng output, so there is no guessing surface for a password style kdf to
+/// defend, and a per row salt would cost the indexed equality lookup every
+/// consumer depends on.
+pub fn capability_token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
@@ -245,6 +246,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::limits::{ATTACHMENT_TOKEN_BYTES, SHARE_TOKEN_BYTES};
     use serde_json::json;
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
@@ -380,39 +382,51 @@ mod tests {
     }
 
     #[test]
-    fn share_tokens_carry_full_entropy_and_are_url_safe() {
-        let token = random_share_token();
-        assert_eq!(token.len(), 22);
-        assert!(
-            token
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        );
-        let decoded = URL_SAFE_NO_PAD.decode(&token).unwrap();
-        assert_eq!(decoded.len(), SHARE_TOKEN_BYTES);
+    fn capability_tokens_carry_full_entropy_and_are_url_safe() {
+        for entropy_bytes in [SHARE_TOKEN_BYTES, ATTACHMENT_TOKEN_BYTES] {
+            let token = random_capability_token(entropy_bytes);
+            assert!(
+                token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "{token}"
+            );
+            let decoded = URL_SAFE_NO_PAD.decode(&token).unwrap();
+            assert_eq!(decoded.len(), entropy_bytes);
 
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..256 {
-            assert!(seen.insert(random_share_token()));
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..256 {
+                assert!(seen.insert(random_capability_token(entropy_bytes)));
+            }
         }
     }
 
     #[test]
+    fn an_attachment_token_carries_at_least_256_bits() {
+        let token = random_capability_token(ATTACHMENT_TOKEN_BYTES);
+        let decoded = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        assert!(decoded.len() * 8 >= 256, "{} bits", decoded.len() * 8);
+    }
+
+    #[test]
     fn the_stored_hash_is_stable_hex_and_never_the_token() {
-        let token = random_share_token();
-        let hash = share_token_hash(&token);
+        let token = random_capability_token(SHARE_TOKEN_BYTES);
+        let hash = capability_token_hash(&token);
         assert_eq!(hash.len(), 64);
         assert!(
             hash.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
         );
         assert_ne!(hash, token);
-        assert_eq!(hash, share_token_hash(&token));
-        assert_ne!(hash, share_token_hash(&random_share_token()));
+        assert_eq!(hash, capability_token_hash(&token));
+        assert_ne!(
+            hash,
+            capability_token_hash(&random_capability_token(SHARE_TOKEN_BYTES))
+        );
 
         // the sha-256 of the empty string, so a swapped algorithm is caught
         assert_eq!(
-            share_token_hash(""),
+            capability_token_hash(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }

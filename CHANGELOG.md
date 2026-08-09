@@ -4,6 +4,17 @@
 
 ### Added
 
+- 2026-08-09: **document attachments**. `POST /documents/{id}/attachments`
+  stores one image against a document, edit role only, raw body up to 16 MiB
+  with the content type from the header. It answers `{"token", "url"}`, and
+  `GET /attachments/{token}` serves those bytes to anyone holding the token,
+  with no other credential and long lived immutable cache headers. The token is
+  256 random bits stored as its SHA-256, the same way share links are kept.
+  Attachments never change, so there is no update route, and deleting a document
+  deletes them. Content types are limited to png, jpeg, webp, gif and avif,
+  since a read carries no credential and runs on agora's own origin. Migration
+  005.
+
 - 2026-08-09: **batch replay keeps its frame**. Every op row carries the seq
   of its frame's first op (migration 004), so a reconnect with `since` replays
   a batch as the one `batch` frame it was applied in rather than N separate

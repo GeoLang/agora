@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use agora_server::auth::{AuthConfig, share_token_hash};
+use agora_server::auth::{AuthConfig, capability_token_hash};
 use agora_server::limits::{
-    MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND, MAX_DOCUMENT_NAME_BYTES,
+    MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND, MAX_DOCUMENT_NAME_BYTES,
     MAX_DOCUMENT_STATE_BYTES, MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES,
     MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
 };
@@ -1911,7 +1911,7 @@ async fn a_share_link_is_stored_only_as_a_hash() {
             .expect("read share_links");
     assert_eq!(stored.len(), 1);
     assert_ne!(stored[0], link, "the raw token is in the database");
-    assert_eq!(stored[0], share_token_hash(&link));
+    assert_eq!(stored[0], capability_token_hash(&link));
 
     // a database read hands over the hash, and the hash is not a credential
     let by_hash = app
@@ -1946,7 +1946,7 @@ async fn a_raw_token_still_revokes_its_link() {
     assert_eq!(revoked.status(), 204);
 
     let flag: bool = sqlx::query_scalar("select revoked from share_links where token_hash = $1")
-        .bind(share_token_hash(&link))
+        .bind(capability_token_hash(&link))
         .fetch_one(&app.state.pool)
         .await
         .expect("read the revoked flag");
@@ -2660,4 +2660,285 @@ async fn a_guest_mention_notifies_a_member_but_a_guest_cannot_list() {
         .await
         .expect("guest list attempt");
     assert_eq!(refused.status(), 401);
+}
+
+/// A one pixel png, so the bytes a test round trips are a real image.
+const PNG_BYTES: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89,
+];
+
+async fn upload_attachment(
+    app: &TestApp,
+    token: Option<&str>,
+    document_id: Uuid,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> reqwest::Response {
+    let request = app
+        .client
+        .post(format!(
+            "{}/documents/{document_id}/attachments",
+            app.http_base
+        ))
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(bytes);
+    let request = match token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    request.send().await.expect("upload attachment")
+}
+
+async fn upload_png(app: &TestApp, token: &str, document_id: Uuid) -> Value {
+    let response = upload_attachment(
+        app,
+        Some(token),
+        document_id,
+        "image/png",
+        PNG_BYTES.to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+    response.json().await.expect("json body")
+}
+
+async fn attachment_rows(app: &TestApp, document_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar("select token_hash from attachments where doc_id = $1")
+        .bind(document_id)
+        .fetch_all(&app.state.pool)
+        .await
+        .expect("read attachments")
+}
+
+#[tokio::test]
+async fn an_editor_uploads_an_attachment_and_anyone_with_the_url_reads_it() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "overlay bitmap").await;
+
+    let created = upload_png(&app, &owner_token, document_id).await;
+    let attachment_token = created["token"].as_str().expect("an attachment token");
+    assert_eq!(
+        created["url"],
+        format!("/attachments/{attachment_token}"),
+        "the url does not reach the token"
+    );
+
+    // no credential at all, which is what an <img src> sends
+    let read = app
+        .client
+        .get(format!(
+            "{}{}",
+            app.http_base,
+            created["url"].as_str().expect("a url")
+        ))
+        .send()
+        .await
+        .expect("read attachment");
+    assert_eq!(read.status(), 200);
+    assert_eq!(read.headers()["content-type"], "image/png");
+    assert_eq!(
+        read.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(read.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(read.bytes().await.expect("bytes").as_ref(), PNG_BYTES);
+
+    let unknown = app
+        .client
+        .get(format!("{}/attachments/{}", app.http_base, "made-up-token"))
+        .send()
+        .await
+        .expect("read an unknown attachment");
+    assert_eq!(unknown.status(), 404);
+}
+
+#[tokio::test]
+async fn an_attachment_is_stored_only_as_a_token_hash() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "hashed attachment").await;
+    let attachment_token = upload_png(&app, &owner_token, document_id).await["token"]
+        .as_str()
+        .expect("an attachment token")
+        .to_string();
+
+    let stored = attachment_rows(&app, document_id).await;
+    assert_eq!(stored.len(), 1);
+    assert_ne!(
+        stored[0], attachment_token,
+        "the raw token is in the database"
+    );
+    assert_eq!(stored[0], capability_token_hash(&attachment_token));
+
+    // a database read hands over the hash, and the hash is not a credential
+    let by_hash = app
+        .client
+        .get(format!("{}/attachments/{}", app.http_base, stored[0]))
+        .send()
+        .await
+        .expect("read by the stored hash");
+    assert_eq!(by_hash.status(), 404);
+}
+
+#[tokio::test]
+async fn only_an_editor_can_upload_an_attachment() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "attachment gate").await;
+
+    let reader = fresh_user();
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &reader, "view")
+            .await
+            .status(),
+        204
+    );
+    let refused = upload_attachment(
+        &app,
+        Some(&platform_token(&reader)),
+        document_id,
+        "image/png",
+        PNG_BYTES.to_vec(),
+    )
+    .await;
+    assert_eq!(refused.status(), 403);
+
+    // a stranger is told the document does not exist, the same as a missing id
+    let stranger = upload_attachment(
+        &app,
+        Some(&platform_token(&fresh_user())),
+        document_id,
+        "image/png",
+        PNG_BYTES.to_vec(),
+    )
+    .await;
+    assert_eq!(stranger.status(), 404);
+    let body: Value = stranger.json().await.expect("json");
+    assert_eq!(body["error"], "no such document");
+
+    let missing = upload_attachment(
+        &app,
+        Some(&owner_token),
+        Uuid::new_v4(),
+        "image/png",
+        PNG_BYTES.to_vec(),
+    )
+    .await;
+    assert_eq!(missing.status(), 404);
+
+    let anonymous =
+        upload_attachment(&app, None, document_id, "image/png", PNG_BYTES.to_vec()).await;
+    assert_eq!(anonymous.status(), 401);
+
+    // a share link session token is not a platform token here either
+    let session = guest_session(&app, &owner_token, document_id, "edit").await;
+    let guest = upload_attachment(
+        &app,
+        Some(&session),
+        document_id,
+        "image/png",
+        PNG_BYTES.to_vec(),
+    )
+    .await;
+    assert_eq!(guest.status(), 401);
+
+    assert!(attachment_rows(&app, document_id).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_content_type_a_browser_would_execute_is_refused() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "content type gate").await;
+
+    for content_type in [
+        "text/html",
+        "image/svg+xml",
+        "application/octet-stream",
+        "text/plain",
+    ] {
+        let refused = upload_attachment(
+            &app,
+            Some(&owner_token),
+            document_id,
+            content_type,
+            b"<script>alert(1)</script>".to_vec(),
+        )
+        .await;
+        assert_eq!(refused.status(), 400, "{content_type} was accepted");
+    }
+
+    let empty = upload_attachment(
+        &app,
+        Some(&owner_token),
+        document_id,
+        "image/png",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(empty.status(), 400);
+
+    assert!(attachment_rows(&app, document_id).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_attachment_cap_takes_the_limit_and_refuses_one_byte_past_it() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "attachment cap").await;
+
+    let at_the_cap = upload_attachment(
+        &app,
+        Some(&owner_token),
+        document_id,
+        "image/png",
+        vec![7u8; MAX_ATTACHMENT_BYTES],
+    )
+    .await;
+    assert_eq!(at_the_cap.status(), 201);
+
+    let past_the_cap = upload_attachment(
+        &app,
+        Some(&owner_token),
+        document_id,
+        "image/png",
+        vec![7u8; MAX_ATTACHMENT_BYTES + 1],
+    )
+    .await;
+    assert_eq!(past_the_cap.status(), 413);
+
+    assert_eq!(
+        attachment_rows(&app, document_id).await.len(),
+        1,
+        "the oversized upload was stored"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_document_deletes_its_attachments() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "attachment cascade").await;
+    let url = upload_png(&app, &owner_token, document_id).await["url"]
+        .as_str()
+        .expect("a url")
+        .to_string();
+
+    sqlx::query("delete from documents where id = $1")
+        .bind(document_id)
+        .execute(&app.state.pool)
+        .await
+        .expect("delete the document");
+
+    assert!(attachment_rows(&app, document_id).await.is_empty());
+    let gone = app
+        .client
+        .get(format!("{}{url}", app.http_base))
+        .send()
+        .await
+        .expect("read a deleted attachment");
+    assert_eq!(gone.status(), 404);
 }

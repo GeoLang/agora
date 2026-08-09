@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod attachments;
 pub mod auth;
 pub mod documents;
 pub mod error;
@@ -55,7 +56,8 @@ impl FromRef<AppState> for AuthConfig {
     }
 }
 
-/// Every route except `/health` and resolving a share link needs a token.
+/// Every route except `/health`, resolving a share link and reading an
+/// attachment needs a token.
 ///
 /// CORS is open because the only credential is an `Authorization` header or an
 /// explicit query param, so a foreign origin gains nothing it did not already
@@ -73,6 +75,11 @@ pub fn router(state: AppState) -> Router {
             put(documents::set_member).delete(documents::remove_member),
         )
         .route("/documents/{id}/links", post(links::create_link))
+        .route(
+            "/documents/{id}/attachments",
+            post(attachments::create_attachment),
+        )
+        .route("/attachments/{token}", get(attachments::get_attachment))
         .route("/notifications", get(notifications::list_notifications))
         .route(
             "/notifications/read",

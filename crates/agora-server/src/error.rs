@@ -39,6 +39,13 @@ impl ApiError {
         }
     }
 
+    pub fn payload_too_large(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message,
+        }
+    }
+
     pub fn internal(message: &'static str) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

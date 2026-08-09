@@ -66,6 +66,8 @@ Every route needs `Authorization: Bearer <platform jwt>` except `GET /health` an
 | `PUT /documents/{id}/members/{userId}` `{"role": "view"\|"edit"}` | Adds a member or changes their role, edit role only. Idempotent. |
 | `DELETE /documents/{id}/members/{userId}` | Removes a member, edit role only. |
 | `POST /documents/{id}/links` `{"role": "view"\|"edit"}` | Mints a share link, edit role only. Returns `{"token": "..."}`. |
+| `POST /documents/{id}/attachments` | Stores one image against the document, edit role only. Raw body, `Content-Type` header. Returns `{"token": "...", "url": "/attachments/..."}`. |
+| `GET /attachments/{token}` | Reads an attachment. No credential beyond the token. |
 | `DELETE /links/{token}` | Revokes a share link, edit role only. |
 | `GET /links/{token}` | Resolves a link to `{"doc": "...", "role": "...", "sessionToken": "..."}`. |
 | `GET /notifications` | The caller's latest mention notifications, newest first. |
@@ -87,6 +89,38 @@ always keeps at least one edit member: removing or demoting the last editor is a
 A `userId` is a platform JWT subject. Agora has no user directory, so it is
 taken as given and only checked for length, and adding a member who never signs
 in costs nothing.
+
+## Attachments
+
+An op value is capped at 64 KiB, so a bitmap an overlay draws cannot travel as
+one. It is uploaded on its own and the op carries its url.
+
+```
+POST /documents/{id}/attachments
+Authorization: Bearer <platform jwt>
+Content-Type: image/png
+
+<the bytes>
+```
+
+The reply is `{"token": "...", "url": "/attachments/<token>"}`, and the url is
+relative to the agora base url the client already uses. The token is 256 random
+bits and the database stores only its SHA-256, so a database read hands over no
+working url. Reading takes the token and nothing else, and it reaches that one
+attachment.
+
+An attachment never changes, so there is no update route and reads are served
+`Cache-Control: public, max-age=31536000, immutable`. Deleting a document
+deletes its attachments.
+
+The content type has to be `image/png`, `image/jpeg`, `image/webp`, `image/gif`
+or `image/avif`, sent without a charset or with one. Anything a browser would
+execute, `text/html` and `image/svg+xml` above all, is a 400: reads carry no
+credential and come from agora's own origin, so a stored script would be an
+editor's code running on the platform origin. Reads also carry
+`X-Content-Type-Options: nosniff`.
+
+Nothing caps how many attachments a document holds.
 
 ## Websocket
 
@@ -197,13 +231,14 @@ one is an `error` message or a 4xx, never a panic.
 | Document name | 200 bytes |
 | Member user id | 128 bytes |
 | Document state | 4 MiB, measured as the sum over stored keys of the key length plus the JSON length of its value |
+| Attachment | 16 MiB, refused while the body is still arriving |
 
-Share link tokens are 128 random bits, url safe. Session tokens expire after 12
-hours.
+Share link tokens are 128 random bits and attachment tokens 256, url safe.
+Session tokens expire after 12 hours.
 
-The database stores only the SHA-256 of a share link token, so a database read
-hands over no working link. The raw token is returned once when the link is
-minted and never again.
+The database stores only the SHA-256 of a share link or attachment token, so a
+database read hands over no working link and no working attachment url. The raw
+token is returned once when it is minted and never again.
 
 ## Revoking a share link
 
@@ -213,6 +248,8 @@ working until it drops. Close the tab or restart agora to cut one off
 immediately.
 
 ## Storage
+
+Attachment bytes sit in Postgres beside everything else, in `attachments`.
 
 Ops are appended to `ops` and folded into `documents.checkpoint` every 256 ops.
 The fold and the prune run in one transaction, and the last 4096 ops per document

@@ -13,6 +13,9 @@ pub const MAX_PRESENCE_BYTES: usize = 4 * 1024;
 /// key length plus the json encoding length of the value.
 pub const MAX_DOCUMENT_STATE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Largest accepted attachment, bytes of the raw upload body.
+pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Longest accepted document name, bytes.
 pub const MAX_DOCUMENT_NAME_BYTES: usize = 200;
 
@@ -47,6 +50,11 @@ pub const SESSION_TOKEN_LIFETIME_HOURS: i64 = 12;
 
 /// Entropy in a share link token, bytes.
 pub const SHARE_TOKEN_BYTES: usize = 16;
+
+/// Entropy in an attachment token, bytes. Wider than a share link token because
+/// an attachment url is handed out to anything that renders the document and
+/// there is nothing else to check on the read.
+pub const ATTACHMENT_TOKEN_BYTES: usize = 32;
 
 /// Notifications one list call returns, newest first.
 pub const NOTIFICATIONS_PAGE_SIZE: i64 = 50;

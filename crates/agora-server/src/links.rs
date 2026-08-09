@@ -6,9 +6,10 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{Caller, random_share_token, share_token_hash};
+use crate::auth::{Caller, capability_token_hash, random_capability_token};
 use crate::documents::require_editor;
 use crate::error::ApiError;
+use crate::limits::SHARE_TOKEN_BYTES;
 use crate::role::DocumentRole;
 
 /// A live share link. Looked up fresh on every use, so the row is the authority
@@ -24,7 +25,7 @@ pub async fn live_link(pool: &PgPool, token: &str) -> Result<Option<ShareLink>, 
     let row = sqlx::query(
         "select doc_id, role from share_links where token_hash = $1 and revoked = false",
     )
-    .bind(share_token_hash(token))
+    .bind(capability_token_hash(token))
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else {
@@ -58,11 +59,11 @@ pub async fn create_link(
 ) -> Result<(StatusCode, Json<CreatedLink>), ApiError> {
     require_editor(&state.pool, document_id, &caller.user_id).await?;
 
-    let token = random_share_token();
+    let token = random_capability_token(SHARE_TOKEN_BYTES);
     sqlx::query(
         "insert into share_links (token_hash, doc_id, role, created_by) values ($1, $2, $3, $4)",
     )
-    .bind(share_token_hash(&token))
+    .bind(capability_token_hash(&token))
     .bind(document_id)
     .bind(request.role.as_str())
     .bind(&caller.user_id)
@@ -77,7 +78,7 @@ pub async fn revoke_link(
     caller: Caller,
     Path(token): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let token_hash = share_token_hash(&token);
+    let token_hash = capability_token_hash(&token);
     let row = sqlx::query("select doc_id from share_links where token_hash = $1")
         .bind(&token_hash)
         .fetch_optional(&state.pool)
