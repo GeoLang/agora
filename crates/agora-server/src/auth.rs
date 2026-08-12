@@ -28,6 +28,9 @@ pub const MIN_SECRET_LEN: usize = 32;
 /// `aud` is not one the validation expects, so neither kind can be replayed as
 /// the other even though both are signed with the same secret.
 pub const SESSION_AUDIENCE: &str = "agora-session";
+const TOOL_TOKEN_USE: &str = "tool";
+pub const AGORA_READ_SCOPE: &str = "agora:read";
+pub const AGORA_WRITE_SCOPE: &str = "agora:write";
 
 /// Claims on a platform token. The platform `role` claim is deliberately not
 /// read: authorization comes from the members table for this document.
@@ -37,6 +40,32 @@ pub struct PlatformClaims {
     pub exp: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenClaims {
+    sub: String,
+    #[serde(rename = "exp")]
+    _exp: usize,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: Option<serde_json::Value>,
+    #[serde(default)]
+    token_use: Option<String>,
+    #[serde(default)]
+    scope: Option<serde_json::Value>,
+}
+
+enum VerifiedCaller {
+    Platform(Caller),
+    Tool { caller: Caller, scopes: Vec<String> },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VerificationError {
+    Invalid,
+    MissingScope,
 }
 
 /// Claims on a share link session token.
@@ -97,20 +126,64 @@ impl AuthConfig {
     /// requires `exp`, so another algorithm, `alg: none`, an expired token and
     /// a wrong secret all fail here.
     pub fn verify_platform(&self, token: &str) -> Option<Caller> {
-        let claims = decode::<PlatformClaims>(token, &self.decoding_key(), &Validation::default())
-            .ok()?
+        match self.decode_caller(token).ok()? {
+            VerifiedCaller::Platform(caller) => Some(caller),
+            VerifiedCaller::Tool { .. } => None,
+        }
+    }
+
+    fn decode_caller(&self, token: &str) -> Result<VerifiedCaller, VerificationError> {
+        let claims = decode::<TokenClaims>(token, &self.decoding_key(), &Validation::default())
+            .map_err(|_| VerificationError::Invalid)?
             .claims;
         if claims.sub.is_empty() {
-            return None;
+            return Err(VerificationError::Invalid);
         }
         let name = claims
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| claims.sub.clone());
-        Some(Caller {
+        let caller = Caller {
             user_id: claims.sub,
             name,
-        })
+        };
+        match claims.token_use.as_deref() {
+            None => Ok(VerifiedCaller::Platform(caller)),
+            Some(TOOL_TOKEN_USE) => {
+                if claims.role.is_some() {
+                    return Err(VerificationError::Invalid);
+                }
+                let scopes = claims
+                    .scope
+                    .and_then(|scope| scope.as_array().cloned())
+                    .ok_or(VerificationError::Invalid)?
+                    .into_iter()
+                    .map(|scope| {
+                        scope
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or(VerificationError::Invalid)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(VerifiedCaller::Tool { caller, scopes })
+            }
+            Some(_) => Err(VerificationError::Invalid),
+        }
+    }
+
+    pub(crate) fn verify_for_scope(
+        &self,
+        token: &str,
+        required_scope: &str,
+    ) -> Result<Caller, VerificationError> {
+        match self.decode_caller(token)? {
+            VerifiedCaller::Platform(caller) => Ok(caller),
+            VerifiedCaller::Tool { caller, scopes } => scopes
+                .iter()
+                .any(|scope| scope == required_scope)
+                .then_some(caller)
+                .ok_or(VerificationError::MissingScope),
+        }
     }
 
     /// Validate a share link session token. `aud` is required here, so a
@@ -235,9 +308,22 @@ where
         };
         // the decode error is not echoed back: it separates expired from bad
         // signature, which helps an attacker more than a caller
+        let required_scope = if matches!(
+            parts.method,
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) {
+            AGORA_READ_SCOPE
+        } else {
+            AGORA_WRITE_SCOPE
+        };
         config
-            .verify_platform(token)
-            .ok_or_else(|| ApiError::unauthorized("invalid or expired token"))
+            .verify_for_scope(token, required_scope)
+            .map_err(|error| match error {
+                VerificationError::Invalid => ApiError::unauthorized("invalid or expired token"),
+                VerificationError::MissingScope => {
+                    ApiError::forbidden("required tool scope missing")
+                }
+            })
     }
 }
 
@@ -305,6 +391,78 @@ mod tests {
 
         assert!(config.verify_platform("").is_none());
         assert!(config.verify_platform("not.a.token").is_none());
+    }
+
+    #[test]
+    fn tool_tokens_need_the_exact_operation_scope() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        let write = sign(&json!({
+            "sub": "user-1",
+            "exp": future(),
+            "token_use": "tool",
+            "scope": [AGORA_WRITE_SCOPE]
+        }));
+        assert!(matches!(
+            config.verify_for_scope(&write, AGORA_READ_SCOPE),
+            Err(VerificationError::MissingScope)
+        ));
+        let caller = config.verify_for_scope(&write, AGORA_WRITE_SCOPE).unwrap();
+        assert_eq!(caller.user_id, "user-1");
+
+        let wrong_service = sign(&json!({
+            "sub": "user-1",
+            "exp": future(),
+            "token_use": "tool",
+            "scope": ["ptolemy:write"]
+        }));
+        assert!(matches!(
+            config.verify_for_scope(&wrong_service, AGORA_WRITE_SCOPE),
+            Err(VerificationError::MissingScope)
+        ));
+    }
+
+    #[test]
+    fn a_tool_token_cannot_fall_back_to_a_role() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        let token = sign(&json!({
+            "sub": "user-1",
+            "exp": future(),
+            "role": "admin",
+            "token_use": "tool",
+            "scope": [AGORA_WRITE_SCOPE]
+        }));
+        assert!(config.verify_platform(&token).is_none());
+        assert!(matches!(
+            config.verify_for_scope(&token, AGORA_WRITE_SCOPE),
+            Err(VerificationError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn malformed_and_unknown_tool_claims_are_invalid() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        for claims in [
+            json!({"sub": "user-1", "exp": future(), "token_use": "tool"}),
+            json!({
+                "sub": "user-1", "exp": future(), "token_use": "tool", "scope": "agora:write"
+            }),
+            json!({
+                "sub": "user-1", "exp": future(), "token_use": "other", "scope": [AGORA_WRITE_SCOPE]
+            }),
+        ] {
+            assert!(matches!(
+                config.verify_for_scope(&sign(&claims), AGORA_WRITE_SCOPE),
+                Err(VerificationError::Invalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn platform_tokens_keep_existing_access_to_both_operations() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        let token = sign(&json!({"sub": "user-1", "exp": future(), "role": "viewer"}));
+        assert!(config.verify_for_scope(&token, AGORA_READ_SCOPE).is_ok());
+        assert!(config.verify_for_scope(&token, AGORA_WRITE_SCOPE).is_ok());
     }
 
     #[test]

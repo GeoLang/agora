@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{BEARER_SUBPROTOCOL, websocket_token};
+use crate::auth::{AGORA_WRITE_SCOPE, BEARER_SUBPROTOCOL, VerificationError, websocket_token};
 use crate::documents::member_role;
 use crate::error::ApiError;
 use crate::limits::{
@@ -50,15 +50,21 @@ async fn authenticate(
     document_id: Uuid,
     token: &str,
 ) -> Result<Identity, ApiError> {
-    if let Some(caller) = state.auth.verify_platform(token) {
-        let role = member_role(&state.pool, document_id, &caller.user_id)
-            .await?
-            .ok_or_else(|| ApiError::forbidden("not a member of this document"))?;
-        return Ok(Identity {
-            actor: caller.user_id,
-            name: caller.name,
-            role,
-        });
+    match state.auth.verify_for_scope(token, AGORA_WRITE_SCOPE) {
+        Ok(caller) => {
+            let role = member_role(&state.pool, document_id, &caller.user_id)
+                .await?
+                .ok_or_else(|| ApiError::forbidden("not a member of this document"))?;
+            return Ok(Identity {
+                actor: caller.user_id,
+                name: caller.name,
+                role,
+            });
+        }
+        Err(VerificationError::MissingScope) => {
+            return Err(ApiError::forbidden("required tool scope missing"));
+        }
+        Err(VerificationError::Invalid) => {}
     }
 
     if let Some(claims) = state.auth.verify_session(token) {
