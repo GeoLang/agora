@@ -18,11 +18,39 @@ Migrations run at startup.
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `PLATFORM_JWT_SECRET` | yes | Shared HS256 secret, 32 bytes or more. The same secret the other platform services validate. |
-| `DATABASE_URL` | yes | Postgres connection string. |
+| `DATABASE_URL` | yes | Postgres connection string. Carries the TLS mode, see below. |
 | `PORT` | no | Port to listen on, `3000` by default, which is the internal port the platform's nginx routes `/agora/` to. |
 
 Copy `.env.example` and fill it in. Nothing reads a `.env` file at runtime, the
 variables come from the environment.
+
+### Database TLS
+
+The server is built with sqlx's `tls-rustls-ring` backend, so it can open a TLS
+connection. Whether it opens one, and whether it checks who answered, is entirely
+up to the `sslmode` in `DATABASE_URL`.
+
+Against RDS, which refuses plaintext because `rds.force_ssl` is set, use:
+
+```
+postgres://agora:PASSWORD@ENDPOINT/agora?sslmode=verify-full&sslrootcert=/etc/ssl/rds-global-bundle.pem
+```
+
+Not `sslmode=require`. In sqlx, `require` encrypts and then accepts whatever
+certificate it is handed, so anything able to answer in the database's place
+reads and rewrites the session, credentials included. Only `verify-ca` and
+`verify-full` check the certificate, and only `verify-full` also checks that the
+hostname matches. The RDS certificate carries the instance endpoint, so point the
+URL at that endpoint and not at a CNAME in front of it.
+
+`sslrootcert` is needed because the Amazon RDS roots are private and appear in no
+public trust store. The image carries the bundle at
+`/etc/ssl/rds-global-bundle.pem`, downloaded from
+`https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem` at build time.
+Running outside the image, pass a path to your own copy.
+
+Local and CI Postgres have no TLS, so their URLs leave `sslmode` unset and get
+sqlx's `prefer`, which is a plaintext connection when the server offers no TLS.
 
 ## Document state
 

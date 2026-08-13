@@ -10,6 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# the RDS roots are not in any public trust store, so sslmode=verify-full needs
+# this bundle named as sslrootcert. it is public, and only roots, no key.
+RUN curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    -o /etc/ssl/rds-global-bundle.pem
+
 RUN useradd -r -s /bin/false agora
 
 COPY --from=builder /app/target/release/agora-server /usr/local/bin/agora-server

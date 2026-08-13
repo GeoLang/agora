@@ -4,6 +4,17 @@
 
 ### Added
 
+- 2026-08-13: **postgres over TLS**. sqlx gains the `tls-rustls-ring` backend, so
+  the server can reach a database with `rds.force_ssl` set, which it previously
+  could not do at all: with no backend compiled in, sqlx's default `prefer`
+  quietly falls back to plaintext and the server refuses it. ring was already
+  here through jsonwebtoken, so this adds rustls and no second TLS stack. The
+  mode lives in `DATABASE_URL`, and hosted wants
+  `sslmode=verify-full&sslrootcert=/etc/ssl/rds-global-bundle.pem`, not
+  `sslmode=require`, which in sqlx encrypts without checking the certificate. The
+  image now carries the RDS root bundle, since those roots are in no public trust
+  store.
+
 - 2026-08-09: **attachments expire once nothing points at them**. Attachments
   carry a `last_referenced_at` stamp (migration 006), set when they are uploaded
   and refreshed by a sweep that finds the attachment's url in the document's
