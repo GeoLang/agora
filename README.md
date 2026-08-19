@@ -64,8 +64,10 @@ sqlx's `prefer`, which is a plaintext connection when the server offers no TLS.
 }
 ```
 
-A layer's `order` is a fractional index string, so a reorder is a write to one
-key rather than a rewrite of the list. Layer, annotation, bookmark and comment
+A layer's `order` is a client convention, a fractional index string, so a reorder
+is a write to one key rather than a rewrite of the list. The server neither reads
+nor validates it: op validation covers the key shape and the value size and
+nothing else. Layer, annotation, bookmark and comment
 values are opaque JSON to the server. Only `meta/name` has server meaning: it has
 to be a string within the name cap, and it also updates the document row.
 
@@ -83,8 +85,13 @@ notifications for that document. Notifications are served by `GET
 
 ## HTTP API
 
-Every route needs `Authorization: Bearer <platform jwt>` except `GET /health` and
-`GET /links/{token}`.
+Every route needs `Authorization: Bearer <platform jwt>` except `GET /health`,
+`GET /links/{token}` and `GET /attachments/{token}`, which carry no credential
+beyond the token in the url.
+
+A scoped tool token is also accepted, on every route and on the websocket. It is
+admitted when it carries `agora:read` for a `GET` or `HEAD` and `agora:write` for
+anything else.
 
 | Route | Does |
 | --- | --- |
@@ -98,7 +105,7 @@ Every route needs `Authorization: Bearer <platform jwt>` except `GET /health` an
 | `GET /attachments/{token}` | Reads an attachment. No credential beyond the token. |
 | `DELETE /links/{token}` | Revokes a share link, edit role only. |
 | `GET /links/{token}` | Resolves a link to `{"doc": "...", "role": "...", "sessionToken": "..."}`. |
-| `GET /notifications` | The caller's latest mention notifications, newest first. |
+| `GET /notifications` | The caller's latest 50 mention notifications, newest first. Hard capped, with no pagination and no total count, so a caller past 50 unread never sees the rest. |
 | `POST /notifications/read` `{"ids": ["..."]}` | Marks the caller's notifications read, every unread one when `ids` is absent. |
 
 `sessionToken` is a short lived HS256 JWT carrying the document, the role and a
@@ -138,8 +145,10 @@ working url. Reading takes the token and nothing else, and it reaches that one
 attachment.
 
 An attachment never changes, so there is no update route and reads are served
-`Cache-Control: public, max-age=31536000, immutable`. Deleting a document
-deletes its attachments.
+`Cache-Control: public, max-age=31536000, immutable`. The schema cascades a
+document's attachments away when the document row is deleted, but the API
+registers no `DELETE /documents/{id}`, so that path is reachable only through
+direct SQL.
 
 The content type has to be `image/png`, `image/jpeg`, `image/webp`, `image/gif`
 or `image/avif`, sent without a charset or with one. Anything a browser would
@@ -241,7 +250,8 @@ or `.`. Anything else is refused.
 
 `peers` goes out on every join and leave. A refused message is an `error` and the
 connection stays open, unless the credential itself is the problem, which is a
-4xx before the handshake completes.
+4xx before the handshake completes. A document already at its peer cap is a third
+case: the handshake completes, then the server sends an `error` and closes.
 
 Apply ops in `seq` order. A client receives its own ops back alongside the `ack`,
 which is what keeps two tabs of one account in step.
@@ -249,8 +259,11 @@ which is what keeps two tabs of one account in step.
 A batch takes one seq per op, so `batch` carries the same ops an `op` frame would
 and only groups them. Apply them in the order given and treat the last seq as the
 one reached. A batch of a single op relays as an `op`, since there is nothing to
-hold together. A reconnect with `since` replays a batch as the same `batch`
-frame it went out as live, so a client catching up never sees one torn.
+hold together. A reconnect with `since` replays a batch as a `batch` frame, but
+only the part of it after `since`: the replay selects on `seq > since`, so a
+`since` landing inside a batch yields the remainder as a shorter `batch`, or as a
+plain `op` when one op is left. What is guaranteed is that the ops arrive in
+`seq` order and none is skipped, not that a batch is always whole.
 
 A connection that falls far enough behind to lose messages is sent a fresh
 `snapshot` instead of the ops it missed, so presence traffic can be dropped under
@@ -310,6 +323,14 @@ The fold and the prune run in one transaction, and the last 4096 ops per documen
 are kept so a reconnect can replay rather than resnapshot. A room is loaded from
 the checkpoint plus that tail on the first join and dropped when the last
 connection leaves.
+
+Known limitation: the 256 counter is per room session, not per document. It sits
+on the in-memory room, so it is zeroed every time the room loads, and the room is
+dropped when the last connection leaves. The prune runs only inside the fold. A
+document only ever edited in sessions shorter than 256 ops therefore never
+checkpoints and never prunes: two sessions of 200 ops leave the counter at zero
+both times. Its checkpoint stays at the creation snapshot, its `ops` rows grow
+without bound, and every join replays the whole log.
 
 ## Tests
 
