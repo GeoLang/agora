@@ -213,7 +213,7 @@ async fn sweep_document(
 ) -> Result<u64, sqlx::Error> {
     // the document was deleted while the sweep ran, and the cascade already
     // took its attachments
-    let Some((state, _)) = current_state(pool, document_id).await? else {
+    let Some((state, ..)) = current_state(pool, document_id).await? else {
         return Ok(0);
     };
     let referenced: Vec<String> = referenced_tokens(&state.snapshot().to_string())

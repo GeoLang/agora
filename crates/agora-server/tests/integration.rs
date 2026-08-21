@@ -465,6 +465,16 @@ async fn expect_join(client: &mut WebsocketClient) -> (Value, Value) {
 /// Ops applied straight through the room, which is the same path the websocket
 /// takes but without a connection rate limit in the way.
 async fn apply_ops_directly(app: &TestApp, document_id: Uuid, actor: &str, count: usize) -> i64 {
+    apply_ops_directly_from(app, document_id, actor, 0, count).await
+}
+
+async fn apply_ops_directly_from(
+    app: &TestApp,
+    document_id: Uuid,
+    actor: &str,
+    start: usize,
+    count: usize,
+) -> i64 {
     let peer = Peer {
         actor: actor.to_string(),
         name: actor.to_string(),
@@ -477,7 +487,7 @@ async fn apply_ops_directly(app: &TestApp, document_id: Uuid, actor: &str, count
         .await
         .expect("join the room");
     let mut last_seq = 0;
-    for index in 0..count {
+    for index in start..start + count {
         last_seq = joined
             .room
             .apply_op(
@@ -1054,6 +1064,40 @@ async fn document_state_survives_a_restart_from_its_checkpoint_and_tail() {
     assert_eq!(layers["l0"]["order"], "a0000");
     assert_eq!(layers["l299"]["order"], "a0299");
     assert_eq!(snapshot["state"]["meta"]["name"], "checkpointed");
+}
+
+#[tokio::test]
+async fn a_checkpoint_folds_once_ops_across_short_sessions_reach_the_interval() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let token = platform_token(&owner);
+    let document_id = create_document(&app, &token, "short sessions").await;
+
+    let last_seq = apply_ops_directly(&app, document_id, &owner, 200).await;
+    assert_eq!(last_seq, 200);
+    assert!(
+        !app.state.rooms.is_loaded(document_id).await,
+        "the room outlived its last connection"
+    );
+
+    let checkpoint_seq: i64 =
+        sqlx::query_scalar("select checkpoint_seq from documents where id = $1")
+            .bind(document_id)
+            .fetch_one(&app.state.pool)
+            .await
+            .expect("read the checkpoint seq");
+    assert_eq!(checkpoint_seq, 0);
+
+    let last_seq = apply_ops_directly_from(&app, document_id, &owner, 200, 56).await;
+    assert_eq!(last_seq, 256);
+
+    let checkpoint_seq: i64 =
+        sqlx::query_scalar("select checkpoint_seq from documents where id = $1")
+            .bind(document_id)
+            .fetch_one(&app.state.pool)
+            .await
+            .expect("read the checkpoint seq");
+    assert_eq!(checkpoint_seq, 256, "no checkpoint was folded");
 }
 
 #[tokio::test]

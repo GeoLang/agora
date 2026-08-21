@@ -86,7 +86,7 @@ struct PeerEntry {
 struct RoomInner {
     state: DocumentState,
     seq: i64,
-    ops_since_checkpoint: u64,
+    checkpoint_seq: i64,
     peers: Vec<PeerEntry>,
 }
 
@@ -118,7 +118,7 @@ pub struct Room {
 
 impl Room {
     async fn load(pool: &PgPool, document_id: Uuid) -> Result<Self, JoinError> {
-        let (state, seq) = current_state(pool, document_id)
+        let (state, seq, checkpoint_seq) = current_state(pool, document_id)
             .await
             .map_err(JoinError::Database)?
             .ok_or(JoinError::DocumentNotFound)?;
@@ -130,7 +130,7 @@ impl Room {
             inner: Mutex::new(RoomInner {
                 state,
                 seq,
-                ops_since_checkpoint: 0,
+                checkpoint_seq,
                 peers: Vec::new(),
             }),
         })
@@ -272,18 +272,17 @@ impl Room {
 
         for op in &applied {
             inner.state.apply(&op.key, op.value.clone());
-            inner.ops_since_checkpoint += 1;
         }
         inner.seq = seq;
 
         self.relay(&relay_frame(actor, applied));
 
-        if inner.ops_since_checkpoint >= CHECKPOINT_INTERVAL_OPS {
+        if inner.seq - inner.checkpoint_seq >= CHECKPOINT_INTERVAL_OPS as i64 {
             let folded = inner.state.snapshot();
             // a failed checkpoint is not an op failure: the op rows are already
             // committed, so the next op retries the fold
             if self.checkpoint(pool, folded, seq).await.is_ok() {
-                inner.ops_since_checkpoint = 0;
+                inner.checkpoint_seq = seq;
             }
         }
         Ok(seq)
@@ -453,15 +452,15 @@ impl Default for RoomRegistry {
 }
 
 /// A document as a joining client would see it: the stored checkpoint with
-/// every op after it applied, and the seq that leaves it at. `None` when there
-/// is no such document.
+/// every op after it applied, the seq that leaves it at, and the seq the
+/// checkpoint was folded at. `None` when there is no such document.
 ///
 /// Read from the database rather than from a live room, so a caller outside the
 /// room registry sees the same document a join would build.
 pub async fn current_state(
     pool: &PgPool,
     document_id: Uuid,
-) -> Result<Option<(DocumentState, i64)>, sqlx::Error> {
+) -> Result<Option<(DocumentState, i64, i64)>, sqlx::Error> {
     let Some(row) = sqlx::query("select checkpoint, checkpoint_seq from documents where id = $1")
         .bind(document_id)
         .fetch_optional(pool)
@@ -490,7 +489,7 @@ pub async fn current_state(
         }
         seq = op_seq;
     }
-    Ok(Some((state, seq)))
+    Ok(Some((state, seq, checkpoint_seq)))
 }
 
 /// The lowest op seq still stored for a document, or `None` once every op has

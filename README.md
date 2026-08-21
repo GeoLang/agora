@@ -318,19 +318,13 @@ immediately.
 
 Attachment bytes sit in Postgres beside everything else, in `attachments`.
 
-Ops are appended to `ops` and folded into `documents.checkpoint` every 256 ops.
-The fold and the prune run in one transaction, and the last 4096 ops per document
-are kept so a reconnect can replay rather than resnapshot. A room is loaded from
-the checkpoint plus that tail on the first join and dropped when the last
-connection leaves.
-
-Known limitation: the 256 counter is per room session, not per document. It sits
-on the in-memory room, so it is zeroed every time the room loads, and the room is
-dropped when the last connection leaves. The prune runs only inside the fold. A
-document only ever edited in sessions shorter than 256 ops therefore never
-checkpoints and never prunes: two sessions of 200 ops leave the counter at zero
-both times. Its checkpoint stays at the creation snapshot, its `ops` rows grow
-without bound, and every join replays the whole log.
+Ops are appended to `ops` and folded into `documents.checkpoint` every 256 ops
+after the last fold (`seq - checkpoint_seq`). The fold and the prune run in one
+transaction, and the last 4096 ops per document are kept so a reconnect can
+replay rather than resnapshot. A room is loaded from the checkpoint plus that
+tail on the first join and dropped when the last connection leaves. The interval
+is the stored gap, not ops in the current room lifetime, so a document edited
+only in short sessions still folds once that gap reaches 256.
 
 ## Tests
 
