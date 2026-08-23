@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agora — Live Map Collaboration</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e;--red:#f85149}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.6}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.container{max-width:1100px;margin:0 auto;padding:0 24px}
+header{border-bottom:1px solid var(--border);padding:64px 0 40px;text-align:center}
+header h1{font-size:3.5rem;color:var(--heading);margin-bottom:12px}
+header .tagline{font-size:1.3rem;color:var(--muted);max-width:750px;margin:0 auto}
+.badges{margin-top:20px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.badges img{height:24px}
+.hero{display:flex;gap:16px;justify-content:center;margin-top:28px;flex-wrap:wrap}
+.hero a{background:var(--accent);color:#fff;padding:12px 28px;border-radius:6px;font-weight:600;font-size:1rem;transition:opacity .2s}
+.hero a:hover{text-decoration:none;opacity:.85}
+.hero a.secondary{background:var(--card);border:1px solid var(--border)}
+section{padding:56px 0}
+section h2{font-size:1.9rem;color:var(--heading);margin-bottom:28px;border-bottom:1px solid var(--border);padding-bottom:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px}
+.card h3{color:var(--heading);margin-bottom:8px;font-size:1.1rem}
+.card ul{list-style:none;padding:0;margin:0}
+.card ul li{padding:3px 0;color:var(--text);font-size:.9rem}
+.card ul li::before{content:"✓ ";color:var(--accent2);font-weight:bold}
+code{background:#1c2128;padding:2px 6px;border-radius:4px;font-size:.85em;color:#f0f6fc}
+pre{background:#1c2128;border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;font-size:.85rem;color:#f0f6fc;margin:12px 0}
+table{width:100%;border-collapse:collapse;margin:12px 0}
+th,td{padding:12px 16px;text-align:left;border-bottom:1px solid var(--border);font-size:.9rem}
+th{color:var(--heading);background:var(--card);position:sticky;top:0}
+footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;margin-top:24px}
+.stat{text-align:center;padding:20px;background:var(--card);border:1px solid var(--border);border-radius:8px}
+.stat .num{font-size:2rem;color:var(--heading);font-weight:bold}
+.stat .label{color:var(--muted);font-size:.85rem;margin-top:4px}
+@media(max-width:600px){header h1{font-size:2.2rem}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+<div class="container">
+<h1>🤝 Agora</h1>
+<p class="tagline">Live multiplayer session service for GeoLang composition documents. One JSON document holds a shared map — layers, annotations, bookmarks, comments — and Agora owns it, orders every edit, and fans the edits out to everyone looking at it.</p>
+<div class="badges">
+<img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
+<img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
+<img src="https://github.com/GeoLang/agora/actions/workflows/ci.yml/badge.svg" alt="CI">
+</div>
+<div class="hero">
+<a href="https://github.com/GeoLang/agora">GitHub</a>
+<a href="https://github.com/GeoLang/agora#running" class="secondary">Running</a>
+<a href="#api" class="secondary">API</a>
+</div>
+<div class="stats">
+<div class="stat"><div class="num">1</div><div class="label">Ordered op stream per document</div></div>
+<div class="stat"><div class="num">2</div><div class="label">Member roles: view, edit</div></div>
+<div class="stat"><div class="num">6</div><div class="label">Postgres tables</div></div>
+<div class="stat"><div class="num">0</div><div class="label">Credentials in a share URL (token, hashed at rest)</div></div>
+</div>
+</div>
+</header>
+
+<section>
+<div class="container">
+<h2>How It Works</h2>
+<p>A document is one JSON object. Clients connect over a WebSocket, send operations, and the server assigns every operation a sequence number before fanning it out — the last writer on a key wins. A periodic checkpoint of the merged document is stored beside the op log, so a late joiner loads the checkpoint and replays the tail instead of the whole history. Agora runs as a single instance and is the only writer to its database.</p>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Features</h2>
+<div class="grid">
+<div class="card">
+<h3>📄 Documents &amp; Members</h3>
+<ul>
+<li>UUID-keyed documents, creator becomes first editor</li>
+<li>Per-document members with view or edit role</li>
+<li>Last-editor protection: a document cannot lose its only editor</li>
+<li>Non-members get "no such document", so ids cannot be probed</li>
+</ul>
+</div>
+<div class="card">
+<h3>🔗 Share Links</h3>
+<ul>
+<li>Tokened links granting view or edit</li>
+<li>Only the token hash is stored server-side</li>
+<li>Revocable at any time</li>
+<li>Visitors get short-lived session tokens, never platform credentials</li>
+</ul>
+</div>
+<div class="card">
+<h3>💬 Comments &amp; Notifications</h3>
+<ul>
+<li>Comments live in the document like any other keyed state</li>
+<li>@-mentions create notifications for the mentioned user</li>
+<li>Notification list and mark-read endpoints</li>
+</ul>
+</div>
+<div class="card">
+<h3>📎 Attachments</h3>
+<ul>
+<li>Binary blobs referenced from the document</li>
+<li>Fetched by token, so image overlays work in a browser</li>
+</ul>
+</div>
+<div class="card">
+<h3>🔌 WebSocket Protocol</h3>
+<ul>
+<li>Ops, batched ops, and presence messages</li>
+<li>Presence is relayed, never persisted</li>
+<li>Frame and batch size limits refuse oversized input</li>
+<li>Bearer token offered as a subprotocol, echoed never</li>
+</ul>
+</div>
+<div class="card">
+<h3>🔐 Auth</h3>
+<ul>
+<li>Platform HS256 JWTs, same secret as the other services</li>
+<li>Scopes: <code>agora:read</code> for GET, <code>agora:write</code> for the rest</li>
+<li>Authorization decided by the members table per document</li>
+<li>Fail-closed: no secret, no start</li>
+</ul>
+</div>
+</div>
+</div>
+</section>
+
+<section id="api">
+<div class="container">
+<h2>REST API</h2>
+<table>
+<thead>
+<tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td>POST / GET</td><td><code>/documents</code></td><td>Create a document / list the caller's documents</td></tr>
+<tr><td>GET</td><td><code>/documents/{id}</code></td><td>Fetch a document (members only)</td></tr>
+<tr><td>PUT / DELETE</td><td><code>/documents/{id}/members/{user_id}</code></td><td>Set or remove a member and role</td></tr>
+<tr><td>POST</td><td><code>/documents/{id}/links</code></td><td>Create a share link</td></tr>
+<tr><td>GET / DELETE</td><td><code>/links/{token}</code></td><td>Resolve or revoke a share link</td></tr>
+<tr><td>POST</td><td><code>/documents/{id}/attachments</code></td><td>Add an attachment</td></tr>
+<tr><td>GET</td><td><code>/attachments/{token}</code></td><td>Fetch an attachment blob</td></tr>
+<tr><td>GET</td><td><code>/notifications</code></td><td>List the caller's notifications</td></tr>
+<tr><td>POST</td><td><code>/notifications/read</code></td><td>Mark notifications read</td></tr>
+<tr><td>GET</td><td><code>/ws</code></td><td>WebSocket upgrade for a document session</td></tr>
+<tr><td>GET</td><td><code>/health</code></td><td>Health check</td></tr>
+</tbody>
+</table>
+<p style="margin-top:16px;color:var(--muted)">In the platform Compose stack, nginx serves all of this under <code>/agora/</code>.</p>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Quick Start</h2>
+<pre># Build and run (migrations run at startup)
+git clone https://github.com/GeoLang/agora.git
+cd agora
+PLATFORM_JWT_SECRET=... DATABASE_URL=postgres://... cargo run -p agora-server</pre>
+<table>
+<thead><tr><th>Variable</th><th>Required</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>PLATFORM_JWT_SECRET</code></td><td>yes</td><td>Shared HS256 secret, 32 bytes or more, the same one the other platform services validate</td></tr>
+<tr><td><code>DATABASE_URL</code></td><td>yes</td><td>Postgres connection string, carries the TLS mode</td></tr>
+<tr><td><code>PORT</code></td><td>no</td><td>Listen port, 3000 by default</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<footer>
+<div class="container">
+<p>Agora is free software under the <a href="https://github.com/GeoLang/agora/blob/master/LICENSE">AGPL-3.0 license</a>.</p>
+<p style="margin-top:8px">Made by <a href="https://github.com/GeoLang">GeoLang</a> — collaboration for the open geospatial stack.</p>
+<p>&copy; 2026 Grok Image Compression Inc. Licensed under AGPL-3.0-or-later.</p>
+</div>
+</footer>
+</body>
+</html>
