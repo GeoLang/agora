@@ -8,6 +8,7 @@ pub mod error;
 pub mod limits;
 pub mod links;
 pub mod notifications;
+pub mod projects;
 pub mod protocol;
 pub mod role;
 pub mod room;
@@ -24,6 +25,7 @@ use sqlx::migrate::MigrateError;
 use tower_http::cors::CorsLayer;
 
 use crate::auth::AuthConfig;
+use crate::projects::ProjectAccess;
 use crate::room::RoomRegistry;
 
 pub const DATABASE_URL_ENV: &str = "DATABASE_URL";
@@ -38,15 +40,27 @@ pub struct AppState {
     pub pool: PgPool,
     pub auth: AuthConfig,
     pub rooms: Arc<RoomRegistry>,
+    /// `None` leaves the members table as the only authority on every document,
+    /// which is where a build with no [`projects::PTOLEMY_URL_ENV`] lands.
+    pub projects: Option<Arc<ProjectAccess>>,
 }
 
 impl AppState {
+    /// Project role resolution off. Turn it on with
+    /// [`AppState::with_projects`], so a state built without thinking about it
+    /// cannot widen access by accident.
     pub fn new(pool: PgPool, auth: AuthConfig) -> Self {
         Self {
             pool,
             auth,
             rooms: Arc::new(RoomRegistry::new()),
+            projects: None,
         }
+    }
+
+    pub fn with_projects(mut self, projects: ProjectAccess) -> Self {
+        self.projects = Some(Arc::new(projects));
+        self
     }
 }
 
@@ -70,6 +84,10 @@ pub fn router(state: AppState) -> Router {
             post(documents::create_document).get(documents::list_documents),
         )
         .route("/documents/{id}", get(documents::get_document))
+        .route(
+            "/documents/{id}/project",
+            put(documents::set_document_project),
+        )
         .route(
             "/documents/{id}/members/{user_id}",
             put(documents::set_member).delete(documents::remove_member),

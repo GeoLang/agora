@@ -16,6 +16,13 @@ hex = "0.4"
 # 9, not 10: 10 pulls rsa 0.9 (RUSTSEC-2023-0071) and fails cargo-deny
 jsonwebtoken = "9"
 rand = "0.9"
+# rustls-tls-webpki-roots pulls rustls/ring, the same provider sqlx's
+# tls-rustls-ring already brings. A second provider in one binary leaves rustls
+# with no default to pick and panics on the first connection.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-webpki-roots",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

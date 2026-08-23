@@ -4,6 +4,19 @@
 
 ### Added
 
+- 2026-08-23: **project roles reach documents**. A document can name a ptolemy
+  project (`project_id`, migration 007), and a caller's role on that project
+  counts on the document: `viewer` reads, `editor` and `owner` edit. It is the
+  wider of that and the members row that applies, so a link never narrows access
+  someone already had. Set it on `POST /documents` or through
+  `PUT /documents/{id}/project`, which takes edit on the document and, when
+  linking, editor or owner on the project asked fresh. Roles come from
+  `GET {PTOLEMY_URL}/api/v1/projects/{id}` with the caller's own bearer token,
+  cached 30 seconds per document and caller. Every failure leaves the caller with
+  their members row alone: an unset `PTOLEMY_URL`, a refusal, a timeout, a scoped
+  tool token, and a share link session, which carries no platform identity for
+  ptolemy to answer about.
+
 - 2026-08-13: **postgres over TLS**. sqlx gains the `tls-rustls-ring` backend, so
   the server can reach a database with `rds.force_ssl` set, which it previously
   could not do at all: with no backend compiled in, sqlx's default `prefer`

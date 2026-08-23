@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agora_server::auth::{AuthConfig, capability_token_hash};
@@ -6,6 +9,7 @@ use agora_server::limits::{
     MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES,
     MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
 };
+use agora_server::projects::ProjectAccess;
 use agora_server::protocol::{BatchOp, OpValue, Peer};
 use agora_server::role::DocumentRole;
 use agora_server::state::META_NAME_KEY;
@@ -67,7 +71,10 @@ async fn restart(app: &TestApp) -> TestApp {
 
 async fn spawn_app_on(pool: PgPool) -> TestApp {
     let auth = AuthConfig::new(TEST_SECRET).expect("test secret is long enough");
-    let state = AppState::new(pool, auth);
+    serve(AppState::new(pool, auth)).await
+}
+
+async fn serve(state: AppState) -> TestApp {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("local address");
     let app = router(state.clone());
@@ -3117,4 +3124,803 @@ async fn a_fresh_upload_survives_the_sweep_before_anything_points_at_it() {
         .await
         .expect("read a fresh attachment");
     assert_eq!(read.status(), 200);
+}
+
+/// Short so a role change can be watched landing once the cache lets go, and
+/// still long enough that two requests inside one test share an answer.
+const TEST_CACHE_TTL: Duration = Duration::from_millis(500);
+
+/// Short so the timeout test does not sit out the production ceiling.
+const TEST_PTOLEMY_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Roles the ptolemy stub hands out, and how it behaves while handing them out.
+#[derive(Default)]
+struct StubBehaviour {
+    roles: HashMap<(Uuid, String), &'static str>,
+    /// Answered to every caller the map does not name, which is what makes a
+    /// test that must never reach ptolemy fail loudly when it does.
+    everyone: Option<&'static str>,
+    /// Answered instead of a role, so a test can make ptolemy refuse or break.
+    status: Option<u16>,
+    /// Sent as a `Location` beside the status, so a test can see whether a
+    /// redirect carrying the caller's token would be followed.
+    location: Option<String>,
+    /// Answers without asking who is calling, which is what lets the far side of
+    /// a redirect grant a role it was never handed a token for.
+    anyone: bool,
+    /// Stalled this long first, so a test can trip the client timeout.
+    delay: Option<Duration>,
+}
+
+#[derive(Clone)]
+struct StubState {
+    behaviour: Arc<Mutex<StubBehaviour>>,
+    calls: Arc<AtomicUsize>,
+}
+
+/// A stand in for ptolemy's project endpoint, the one external boundary the
+/// project role resolver crosses.
+struct PtolemyStub {
+    base_url: String,
+    state: StubState,
+}
+
+/// Who is asking, read out of the token the resolver forwarded. A request with
+/// no usable token gets no subject, which is how a test proves the caller's own
+/// credential is what travels.
+fn bearer_subject(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    let claims = jsonwebtoken::decode::<Value>(
+        raw,
+        &jsonwebtoken::DecodingKey::from_secret(TEST_SECRET.as_bytes()),
+        &jsonwebtoken::Validation::new(Algorithm::HS256),
+    )
+    .ok()?
+    .claims;
+    claims["sub"].as_str().map(str::to_string)
+}
+
+async fn stub_project(
+    axum::extract::State(state): axum::extract::State<StubState>,
+    axum::extract::Path(project_id): axum::extract::Path<Uuid>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    let (status, location, delay, anyone, everyone, roles) = {
+        let behaviour = state.behaviour.lock().expect("stub behaviour");
+        (
+            behaviour.status,
+            behaviour.location.clone(),
+            behaviour.delay,
+            behaviour.anyone,
+            behaviour.everyone,
+            behaviour.roles.clone(),
+        )
+    };
+    let subject = bearer_subject(&headers);
+    if subject.is_none() && !anyone {
+        return (axum::http::StatusCode::UNAUTHORIZED, "no usable bearer").into_response();
+    }
+    let role = subject
+        .and_then(|subject| roles.get(&(project_id, subject)).copied())
+        .or(everyone);
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    if let Some(status) = status {
+        let status = axum::http::StatusCode::from_u16(status).expect("a status code");
+        return match location {
+            Some(location) => (status, [(axum::http::header::LOCATION, location)]).into_response(),
+            None => (status, "the stub was told to refuse").into_response(),
+        };
+    }
+    match role {
+        Some(role) => axum::Json(json!({"id": project_id, "role": role})).into_response(),
+        // ptolemy answers an error status for a caller who is not a member
+        None => (axum::http::StatusCode::FORBIDDEN, "not a member").into_response(),
+    }
+}
+
+async fn spawn_ptolemy_stub() -> PtolemyStub {
+    let state = StubState {
+        behaviour: Arc::new(Mutex::new(StubBehaviour::default())),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    // exactly the pinned path and nothing else, so a resolver asking elsewhere
+    // gets a 404 and every project test fails
+    let router = axum::Router::new()
+        .route(
+            "/api/v1/projects/{project_id}",
+            axum::routing::get(stub_project),
+        )
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub");
+    let address = listener.local_addr().expect("stub address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    PtolemyStub {
+        base_url: format!("http://{address}"),
+        state,
+    }
+}
+
+impl PtolemyStub {
+    fn behaviour(&self) -> std::sync::MutexGuard<'_, StubBehaviour> {
+        self.state.behaviour.lock().expect("stub behaviour")
+    }
+
+    fn grant(&self, project_id: Uuid, user_id: &str, role: &'static str) {
+        self.behaviour()
+            .roles
+            .insert((project_id, user_id.to_string()), role);
+    }
+
+    fn revoke(&self, project_id: Uuid, user_id: &str) {
+        self.behaviour()
+            .roles
+            .remove(&(project_id, user_id.to_string()));
+    }
+
+    fn grant_everyone(&self, role: &'static str) {
+        self.behaviour().everyone = Some(role);
+    }
+
+    fn answer_with(&self, status: u16) {
+        self.behaviour().status = Some(status);
+    }
+
+    fn redirect_to(&self, elsewhere: &PtolemyStub, project_id: Uuid) {
+        let mut behaviour = self.behaviour();
+        behaviour.status = Some(302);
+        behaviour.location = Some(format!(
+            "{}/api/v1/projects/{project_id}",
+            elsewhere.base_url
+        ));
+    }
+
+    fn answer_anyone(&self, role: &'static str) {
+        let mut behaviour = self.behaviour();
+        behaviour.anyone = true;
+        behaviour.everyone = Some(role);
+    }
+
+    fn stall_past_the_timeout(&self) {
+        self.behaviour().delay = Some(TEST_PTOLEMY_TIMEOUT * 4);
+    }
+
+    fn calls(&self) -> usize {
+        self.state.calls.load(Ordering::SeqCst)
+    }
+}
+
+async fn spawn_app_with_projects(stub: &PtolemyStub) -> TestApp {
+    let auth = AuthConfig::new(TEST_SECRET).expect("test secret is long enough");
+    let projects = ProjectAccess::new(&stub.base_url, TEST_CACHE_TTL, TEST_PTOLEMY_TIMEOUT)
+        .expect("the stub url is usable");
+    serve(AppState::new(test_pool().await, auth).with_projects(projects)).await
+}
+
+async fn create_document_in_project(
+    app: &TestApp,
+    token: &str,
+    name: &str,
+    project_id: Uuid,
+) -> Uuid {
+    let response = app
+        .client
+        .post(format!("{}/documents", app.http_base))
+        .bearer_auth(token)
+        .json(&json!({"name": name, "projectId": project_id}))
+        .send()
+        .await
+        .expect("create a document in a project");
+    assert_eq!(response.status(), 201);
+    let body: Value = response.json().await.expect("json body");
+    body["id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("a document id")
+}
+
+async fn set_document_project(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    project_id: Option<Uuid>,
+) -> reqwest::Response {
+    app.client
+        .put(format!("{}/documents/{document_id}/project", app.http_base))
+        .bearer_auth(token)
+        .json(&json!({"projectId": project_id}))
+        .send()
+        .await
+        .expect("set the document's project")
+}
+
+async fn get_document(app: &TestApp, token: &str, document_id: Uuid) -> reqwest::Response {
+    app.client
+        .get(format!("{}/documents/{document_id}", app.http_base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("get the document")
+}
+
+async fn stored_project(app: &TestApp, document_id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Option<Uuid>>("select project_id from documents where id = $1")
+        .bind(document_id)
+        .fetch_one(&app.state.pool)
+        .await
+        .expect("read the stored project")
+}
+
+async fn add_member_directly(app: &TestApp, document_id: Uuid, user_id: &str, role: &str) {
+    sqlx::query("insert into members (doc_id, user_id, role) values ($1, $2, $3)")
+        .bind(document_id)
+        .bind(user_id)
+        .bind(role)
+        .execute(&app.state.pool)
+        .await
+        .expect("add a member");
+}
+
+#[tokio::test]
+async fn a_project_viewer_reads_a_linked_document_but_cannot_edit_it() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let reader = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &reader, "viewer");
+    let owner_token = platform_token(&owner);
+    let reader_token = platform_token(&reader);
+
+    let document_id =
+        create_document_in_project(&app, &owner_token, "project reading", project_id).await;
+    assert_eq!(stored_project(&app, document_id).await, Some(project_id));
+
+    assert_eq!(
+        get_document(&app, &reader_token, document_id)
+            .await
+            .status(),
+        200
+    );
+    // the project link is the whole reason they got in: they have no members row
+    assert_eq!(
+        member_roles(&app, &owner_token, document_id).await,
+        vec![(owner.clone(), "edit".to_string())]
+    );
+
+    let mut client = open(&app, document_id, &reader_token, None).await;
+    let (snapshot, _) = expect_join(&mut client).await;
+    assert_eq!(snapshot["role"], "view");
+    let reason = send_and_refuse(&mut client, 1, "layers/sneaky", json!({"order": "a0"})).await;
+    assert_eq!(reason, "edit role required");
+
+    // and the editor only http routes stay shut
+    assert_eq!(
+        set_member(&app, &reader_token, document_id, &fresh_user(), "view")
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        mint_link_response(&app, &reader_token, document_id, "view")
+            .await
+            .status(),
+        403
+    );
+}
+
+async fn mint_link_response(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    role: &str,
+) -> reqwest::Response {
+    app.client
+        .post(format!("{}/documents/{document_id}/links", app.http_base))
+        .bearer_auth(token)
+        .json(&json!({"role": role}))
+        .send()
+        .await
+        .expect("mint a link")
+}
+
+#[tokio::test]
+async fn a_project_editor_and_a_project_owner_both_edit_a_linked_document() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let creator = fresh_user();
+    let editor = fresh_user();
+    let owner = fresh_user();
+    stub.grant(project_id, &creator, "editor");
+    stub.grant(project_id, &editor, "editor");
+    stub.grant(project_id, &owner, "owner");
+    let creator_token = platform_token(&creator);
+
+    let document_id =
+        create_document_in_project(&app, &creator_token, "project editing", project_id).await;
+
+    for (user, token) in [
+        (&editor, platform_token(&editor)),
+        (&owner, platform_token(&owner)),
+    ] {
+        let mut client = open(&app, document_id, &token, None).await;
+        let (snapshot, _) = expect_join(&mut client).await;
+        assert_eq!(snapshot["role"], "edit", "{user} was not given edit");
+        let seq = send_and_settle(
+            &mut client,
+            1,
+            &format!("layers/{user}"),
+            json!({"order": "a0"}),
+        )
+        .await;
+        assert!(seq > 0);
+        client.close().await;
+
+        // an editor only http route works for them too
+        assert_eq!(
+            mint_link_response(&app, &token, document_id, "view")
+                .await
+                .status(),
+            201
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_membership_and_no_project_role_is_no_such_document() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    let owner_token = platform_token(&owner);
+    let document_id = create_document_in_project(&app, &owner_token, "no way in", project_id).await;
+
+    // the stub names nobody else, so ptolemy refuses this caller
+    let stranger_token = platform_token(&fresh_user());
+    let refused = get_document(&app, &stranger_token, document_id).await;
+    assert_eq!(refused.status(), 404);
+    let body: Value = refused.json().await.expect("json body");
+    assert_eq!(body["error"], "no such document");
+
+    // indistinguishable from a document that was never there
+    let missing = get_document(&app, &stranger_token, Uuid::new_v4()).await;
+    assert_eq!(missing.status(), 404);
+    let missing: Value = missing.json().await.expect("json body");
+    assert_eq!(missing["error"], "no such document");
+
+    let refused = connect_with_subprotocol(&app, document_id, &stranger_token, None).await;
+    assert_eq!(handshake_status(refused), Some(403));
+}
+
+#[tokio::test]
+async fn the_members_table_role_wins_when_it_is_wider_than_the_project_role() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let member = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    // only a reader on the project, but an editor on this one document
+    stub.grant(project_id, &member, "viewer");
+    let owner_token = platform_token(&owner);
+    let member_token = platform_token(&member);
+
+    let document_id =
+        create_document_in_project(&app, &owner_token, "members win", project_id).await;
+    assert_eq!(
+        set_member(&app, &owner_token, document_id, &member, "edit")
+            .await
+            .status(),
+        204
+    );
+
+    let mut client = open(&app, document_id, &member_token, None).await;
+    let (snapshot, _) = expect_join(&mut client).await;
+    assert_eq!(
+        snapshot["role"], "edit",
+        "a project viewer lost their edit row"
+    );
+    let seq = send_and_settle(&mut client, 1, "layers/kept", json!({"order": "a0"})).await;
+    assert!(seq > 0);
+}
+
+#[tokio::test]
+async fn a_refusing_ptolemy_leaves_only_the_members_table_role() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let project_only = fresh_user();
+    let direct = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &project_only, "editor");
+    let owner_token = platform_token(&owner);
+    let document_id =
+        create_document_in_project(&app, &owner_token, "ptolemy is down", project_id).await;
+    add_member_directly(&app, document_id, &direct, "view").await;
+
+    let project_only_token = platform_token(&project_only);
+    let direct_token = platform_token(&direct);
+    assert_eq!(
+        get_document(&app, &project_only_token, document_id)
+            .await
+            .status(),
+        200,
+        "the project editor could not get in while ptolemy was healthy"
+    );
+
+    stub.answer_with(403);
+    // the healthy answer is cached, so wait it out before reading again
+    tokio::time::sleep(TEST_CACHE_TTL * 2).await;
+    assert_eq!(
+        get_document(&app, &project_only_token, document_id)
+            .await
+            .status(),
+        404,
+        "a project only caller kept access through a refusal"
+    );
+    assert_eq!(
+        get_document(&app, &direct_token, document_id)
+            .await
+            .status(),
+        200,
+        "a direct member lost access to a refusal that was not about them"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_ptolemy_leaves_only_the_members_table_role() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let project_only = fresh_user();
+    let direct = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &project_only, "editor");
+    let owner_token = platform_token(&owner);
+    let document_id =
+        create_document_in_project(&app, &owner_token, "ptolemy is slow", project_id).await;
+    add_member_directly(&app, document_id, &direct, "view").await;
+
+    stub.stall_past_the_timeout();
+    tokio::time::sleep(TEST_CACHE_TTL * 2).await;
+
+    assert_eq!(
+        get_document(&app, &platform_token(&project_only), document_id)
+            .await
+            .status(),
+        404,
+        "a project only caller kept access through a timeout"
+    );
+    assert_eq!(
+        get_document(&app, &platform_token(&direct), document_id)
+            .await
+            .status(),
+        200,
+        "a direct member lost access to a timeout"
+    );
+}
+
+#[tokio::test]
+async fn linking_a_document_to_a_project_needs_document_edit_and_project_edit() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let outsider = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "to be linked").await;
+
+    // an editor on the document who only reads the project cannot pull it in
+    stub.grant(project_id, &owner, "viewer");
+    let refused = set_document_project(&app, &owner_token, document_id, Some(project_id)).await;
+    assert_eq!(refused.status(), 403);
+    assert_eq!(stored_project(&app, document_id).await, None);
+
+    // an editor on the project with no role on the document learns nothing
+    stub.grant(project_id, &outsider, "owner");
+    let refused = set_document_project(
+        &app,
+        &platform_token(&outsider),
+        document_id,
+        Some(project_id),
+    )
+    .await;
+    assert_eq!(refused.status(), 404);
+    assert_eq!(stored_project(&app, document_id).await, None);
+
+    // both halves, so the link lands and a project reader gets in behind it
+    stub.grant(project_id, &owner, "editor");
+    let reader = fresh_user();
+    stub.grant(project_id, &reader, "viewer");
+    let reader_token = platform_token(&reader);
+    assert_eq!(
+        get_document(&app, &reader_token, document_id)
+            .await
+            .status(),
+        404
+    );
+    let linked = set_document_project(&app, &owner_token, document_id, Some(project_id)).await;
+    assert_eq!(linked.status(), 204);
+    assert_eq!(stored_project(&app, document_id).await, Some(project_id));
+
+    let detail = get_document(&app, &reader_token, document_id).await;
+    assert_eq!(detail.status(), 200);
+    let detail: Value = detail.json().await.expect("json body");
+    assert_eq!(detail["projectId"], project_id.to_string());
+}
+
+#[tokio::test]
+async fn unlinking_a_document_takes_document_edit_alone_and_shuts_the_project_out() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let reader = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &reader, "viewer");
+    let owner_token = platform_token(&owner);
+    let reader_token = platform_token(&reader);
+    let document_id = create_document_in_project(&app, &owner_token, "to be cut", project_id).await;
+    assert_eq!(
+        get_document(&app, &reader_token, document_id)
+            .await
+            .status(),
+        200
+    );
+
+    // dropped to a reader on the project, which is still enough to unlink
+    stub.grant(project_id, &owner, "viewer");
+    let unlinked = set_document_project(&app, &owner_token, document_id, None).await;
+    assert_eq!(unlinked.status(), 204);
+    assert_eq!(stored_project(&app, document_id).await, None);
+
+    assert_eq!(
+        get_document(&app, &reader_token, document_id)
+            .await
+            .status(),
+        404,
+        "an unlinked document still answered a project reader"
+    );
+    // a caller with no role on the document cannot unlink one either
+    assert_eq!(
+        set_document_project(&app, &reader_token, document_id, None)
+            .await
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_project_role_is_reused_until_the_cache_ttl_runs_out() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let reader = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &reader, "viewer");
+    let owner_token = platform_token(&owner);
+    let reader_token = platform_token(&reader);
+    let document_id = create_document_in_project(&app, &owner_token, "cached", project_id).await;
+
+    assert_eq!(
+        get_document(&app, &reader_token, document_id)
+            .await
+            .status(),
+        200
+    );
+    let after_first = stub.calls();
+
+    stub.revoke(project_id, &reader);
+    assert_eq!(
+        get_document(&app, &reader_token, document_id)
+            .await
+            .status(),
+        200,
+        "the cached role was not reused"
+    );
+    assert_eq!(
+        stub.calls(),
+        after_first,
+        "ptolemy was asked again inside the ttl"
+    );
+
+    tokio::time::sleep(TEST_CACHE_TTL * 2).await;
+    assert_eq!(
+        get_document(&app, &reader_token, document_id)
+            .await
+            .status(),
+        404,
+        "a revoked project role outlived the ttl"
+    );
+    assert!(
+        stub.calls() > after_first,
+        "ptolemy was never asked again after the ttl"
+    );
+}
+
+#[tokio::test]
+async fn a_share_link_visitor_never_gets_a_project_role() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    // anyone who asks is an owner, so a link visitor that resolved would edit
+    stub.grant_everyone("owner");
+    let owner_token = platform_token(&owner);
+    let document_id =
+        create_document_in_project(&app, &owner_token, "shared out", project_id).await;
+
+    let guest_token = guest_session(&app, &owner_token, document_id, "view").await;
+    let before_the_guest = stub.calls();
+
+    let mut guest = open(&app, document_id, &guest_token, None).await;
+    let (snapshot, _) = expect_join(&mut guest).await;
+    assert_eq!(
+        snapshot["role"], "view",
+        "a link visitor picked up a project role"
+    );
+    let reason = send_and_refuse(&mut guest, 1, "layers/guest", json!({"order": "a0"})).await;
+    assert_eq!(reason, "edit role required");
+    assert_eq!(
+        stub.calls(),
+        before_the_guest,
+        "a link visitor was taken to ptolemy"
+    );
+}
+
+#[tokio::test]
+async fn a_document_in_no_project_never_reaches_ptolemy() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    stub.grant_everyone("owner");
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "unlinked").await;
+
+    assert_eq!(
+        get_document(&app, &owner_token, document_id).await.status(),
+        200
+    );
+    let stranger_token = platform_token(&fresh_user());
+    assert_eq!(
+        get_document(&app, &stranger_token, document_id)
+            .await
+            .status(),
+        404,
+        "an unlinked document let a stranger in"
+    );
+    assert_eq!(
+        stub.calls(),
+        0,
+        "an unlinked document sent the caller to ptolemy"
+    );
+}
+
+#[tokio::test]
+async fn without_a_configured_ptolemy_only_the_members_table_grants_access() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "no resolver").await;
+    let project_id = Uuid::new_v4();
+
+    // the route refuses to link at all when resolution is off, so there is
+    // nothing that could hand out a project role
+    let refused = set_document_project(&app, &owner_token, document_id, Some(project_id)).await;
+    assert_eq!(refused.status(), 400);
+
+    sqlx::query("update documents set project_id = $2 where id = $1")
+        .bind(document_id)
+        .bind(project_id)
+        .execute(&app.state.pool)
+        .await
+        .expect("link the document behind the api");
+
+    let stranger_token = platform_token(&fresh_user());
+    assert_eq!(
+        get_document(&app, &stranger_token, document_id)
+            .await
+            .status(),
+        404,
+        "a linked document granted access with no way to check the project"
+    );
+    assert_eq!(
+        get_document(&app, &owner_token, document_id).await.status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_scoped_tool_token_gets_no_project_role() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant_everyone("owner");
+    let owner_token = platform_token(&owner);
+    let document_id =
+        create_document_in_project(&app, &owner_token, "tool token", project_id).await;
+
+    // a tool token is minted to reach agora, so it is never spent on ptolemy
+    let tool = fresh_user();
+    let tool_token = tool_token(&tool, &["agora:read", "agora:write"]);
+    assert_eq!(
+        get_document(&app, &tool_token, document_id).await.status(),
+        404,
+        "a tool token picked up a project role"
+    );
+
+    add_member_directly(&app, document_id, &tool, "view").await;
+    assert_eq!(
+        get_document(&app, &tool_token, document_id).await.status(),
+        200,
+        "a tool token lost its members table role"
+    );
+}
+
+fn tool_token(subject: &str, scopes: &[&str]) -> String {
+    let expires_at = time::OffsetDateTime::now_utc().unix_timestamp() + 3600;
+    let claims = json!({
+        "sub": subject,
+        "exp": expires_at,
+        "token_use": "tool",
+        "scope": scopes,
+    });
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .expect("sign a tool token")
+}
+
+#[tokio::test]
+async fn a_redirecting_ptolemy_grants_nothing() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let project_only = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &project_only, "owner");
+    let owner_token = platform_token(&owner);
+    let document_id =
+        create_document_in_project(&app, &owner_token, "redirected", project_id).await;
+
+    // somewhere else entirely, handing out owner to anyone who arrives
+    let elsewhere = spawn_ptolemy_stub().await;
+    elsewhere.answer_anyone("owner");
+    stub.redirect_to(&elsewhere, project_id);
+    tokio::time::sleep(TEST_CACHE_TTL * 2).await;
+
+    assert_eq!(
+        get_document(&app, &platform_token(&project_only), document_id)
+            .await
+            .status(),
+        404,
+        "a redirect was followed or taken as an answer"
+    );
+    assert_eq!(
+        elsewhere.calls(),
+        0,
+        "the caller's token was carried to the redirect target"
+    );
 }

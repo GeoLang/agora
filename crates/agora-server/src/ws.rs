@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::{AGORA_WRITE_SCOPE, BEARER_SUBPROTOCOL, VerificationError, websocket_token};
-use crate::documents::member_role;
+use crate::documents::{effective_role, project_grant};
 use crate::error::ApiError;
 use crate::limits::{
     DIRECT_CHANNEL_CAPACITY, MAX_BATCH_OPS, MAX_INBOUND_FRAME_BYTES, MAX_PRESENCE_BYTES,
@@ -43,8 +43,11 @@ struct Identity {
     role: DocumentRole,
 }
 
-/// Either a platform member of this document or a live share link visitor.
-/// Everything else is refused before the handshake completes.
+/// Either a platform caller with a role on this document or a live share link
+/// visitor. Everything else is refused before the handshake completes.
+///
+/// The role is fixed here for the life of the connection, project half included,
+/// which is what it already was for the members half.
 async fn authenticate(
     state: &AppState,
     document_id: Uuid,
@@ -52,7 +55,8 @@ async fn authenticate(
 ) -> Result<Identity, ApiError> {
     match state.auth.verify_for_scope(token, AGORA_WRITE_SCOPE) {
         Ok(caller) => {
-            let role = member_role(&state.pool, document_id, &caller.user_id)
+            let grant = project_grant(state, document_id, &caller).await?;
+            let role = effective_role(&state.pool, document_id, &caller.user_id, grant)
                 .await?
                 .ok_or_else(|| ApiError::forbidden("not a member of this document"))?;
             return Ok(Identity {
@@ -73,6 +77,9 @@ async fn authenticate(
         }
         // the row, not the claim, decides the role, so revoking a link stops
         // the next connection even while its token is still unexpired
+        //
+        // no project resolution here on purpose: a link visitor has no platform
+        // identity for ptolemy to have a role for, so the link is the whole grant
         let link = live_link(&state.pool, &claims.link)
             .await?
             .ok_or_else(|| ApiError::forbidden("share link is revoked"))?;

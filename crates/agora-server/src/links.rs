@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::{Caller, capability_token_hash, random_capability_token};
-use crate::documents::require_editor;
+use crate::documents::{project_grant, require_editor};
 use crate::error::ApiError;
 use crate::limits::SHARE_TOKEN_BYTES;
 use crate::role::DocumentRole;
@@ -57,7 +57,8 @@ pub async fn create_link(
     Path(document_id): Path<Uuid>,
     Json(request): Json<CreateLinkRequest>,
 ) -> Result<(StatusCode, Json<CreatedLink>), ApiError> {
-    require_editor(&state.pool, document_id, &caller.user_id).await?;
+    let grant = project_grant(&state, document_id, &caller).await?;
+    require_editor(&state.pool, document_id, &caller.user_id, grant).await?;
 
     let token = random_capability_token(SHARE_TOKEN_BYTES);
     sqlx::query(
@@ -90,7 +91,8 @@ pub async fn revoke_link(
     let document_id: Uuid = row.try_get("doc_id")?;
     // a caller who cannot edit the document is told the link does not exist,
     // so a token cannot be tested for existence
-    require_editor(&state.pool, document_id, &caller.user_id)
+    let grant = project_grant(&state, document_id, &caller).await?;
+    require_editor(&state.pool, document_id, &caller.user_id, grant)
         .await
         .map_err(|_| missing())?;
 

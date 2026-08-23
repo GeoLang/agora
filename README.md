@@ -20,9 +20,27 @@ Migrations run at startup.
 | `PLATFORM_JWT_SECRET` | yes | Shared HS256 secret, 32 bytes or more. The same secret the other platform services validate. |
 | `DATABASE_URL` | yes | Postgres connection string. Carries the TLS mode, see below. |
 | `PORT` | no | Port to listen on, `3000` by default, which is the internal port the platform's nginx routes `/agora/` to. |
+| `PTOLEMY_URL` | no | Ptolemy's base url, `http://` or `https://`. Turns on project roles, see below. Unset, only agora's own members reach a document, and startup says so. |
 
 Copy `.env.example` and fill it in. Nothing reads a `.env` file at runtime, the
 variables come from the environment.
+
+## Project roles
+
+A document can name a ptolemy project, and then a caller's role on that project
+counts on the document: `viewer` reads, `editor` and `owner` edit. It is combined
+with the members table rather than replacing it, so whichever of the two is wider
+wins and taking a document into a project never narrows who already had it.
+
+Set the link with `POST /documents` (`projectId`) or `PUT /documents/{id}/project`
+(`{"projectId": ...}`, `null` to unlink). Linking takes edit on the document and
+editor or owner on the project. Unlinking takes edit on the document alone.
+
+Roles are read from ptolemy with the caller's own bearer token, cached for 30
+seconds per document and caller. Every way that call can fail, an unset
+`PTOLEMY_URL` included, leaves the caller with their members table role and
+nothing else. Share link visitors never get a project role: the link is their
+whole grant.
 
 ### Database TLS
 
@@ -95,9 +113,10 @@ anything else.
 
 | Route | Does |
 | --- | --- |
-| `POST /documents` `{"name": "..."}` | Creates a document. The caller becomes its edit member. |
-| `GET /documents` | The caller's documents. |
-| `GET /documents/{id}` | Name, creation details and members. |
+| `POST /documents` `{"name": "...", "projectId": "..."}` | Creates a document. The caller becomes its edit member. `projectId` is optional and takes editor or owner on that project. |
+| `GET /documents` | The caller's documents. Members rows only, so a document reached through a project role alone is not listed. |
+| `GET /documents/{id}` | Name, creation details, project and members. |
+| `PUT /documents/{id}/project` `{"projectId": "..."\|null}` | Links the document to a project or unlinks it. Edit role, plus editor or owner on the project when linking. |
 | `PUT /documents/{id}/members/{userId}` `{"role": "view"\|"edit"}` | Adds a member or changes their role, edit role only. Idempotent. |
 | `DELETE /documents/{id}/members/{userId}` | Removes a member, edit role only. |
 | `POST /documents/{id}/links` `{"role": "view"\|"edit"}` | Mints a share link, edit role only. Returns `{"token": "..."}`. |

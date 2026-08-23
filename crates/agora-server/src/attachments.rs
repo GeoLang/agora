@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::{Caller, capability_token_hash, random_capability_token};
-use crate::documents::require_editor;
+use crate::documents::{project_grant, require_editor};
 use crate::error::ApiError;
 use crate::limits::{
     ATTACHMENT_GRACE_DAYS, ATTACHMENT_SWEEP_INTERVAL_HOURS, ATTACHMENT_TOKEN_BYTES,
@@ -69,8 +69,8 @@ pub struct CreatedAttachment {
 }
 
 /// Store one blob against a document. Edit role on that document, the same
-/// members lookup an op write goes through, and a caller who is not a member is
-/// told the document does not exist.
+/// lookup an op write goes through, and a caller with no role on it is told the
+/// document does not exist.
 ///
 /// The role is checked before the body is read, and the body is read through a
 /// cap, so neither a stranger nor an editor can push more than
@@ -82,7 +82,8 @@ pub async fn create_attachment(
     headers: HeaderMap,
     body: Body,
 ) -> Result<(StatusCode, Json<CreatedAttachment>), ApiError> {
-    require_editor(&state.pool, document_id, &caller.user_id).await?;
+    let grant = project_grant(&state, document_id, &caller).await?;
+    require_editor(&state.pool, document_id, &caller.user_id, grant).await?;
 
     let declared = headers
         .get(header::CONTENT_TYPE)

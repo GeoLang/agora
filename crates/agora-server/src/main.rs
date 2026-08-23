@@ -1,5 +1,6 @@
 use agora_server::attachments::sweep_periodically;
 use agora_server::auth::AuthConfig;
+use agora_server::projects::{PTOLEMY_URL_ENV, ProjectAccess};
 use agora_server::{
     AppState, DATABASE_URL_ENV, DEFAULT_PORT, PORT_ENV, connect_pool, migrate, router,
 };
@@ -14,6 +15,7 @@ async fn main() {
 
 async fn start() -> Result<(), String> {
     let auth = AuthConfig::from_env()?;
+    let projects = ProjectAccess::from_env()?;
     let database_url =
         std::env::var(DATABASE_URL_ENV).map_err(|_| format!("{DATABASE_URL_ENV} is not set"))?;
 
@@ -38,7 +40,17 @@ async fn start() -> Result<(), String> {
         .map_err(|error| format!("could not bind {bind}: {error}"))?;
     println!("agora listening on {bind}");
 
-    axum::serve(listener, router(AppState::new(pool, auth)))
+    let state = match projects {
+        Some(projects) => AppState::new(pool, auth).with_projects(projects),
+        None => {
+            println!(
+                "{PTOLEMY_URL_ENV} is not set: project roles grant nothing and only agora's own \
+                 members reach a document"
+            );
+            AppState::new(pool, auth)
+        }
+    };
+    axum::serve(listener, router(state))
         .await
         .map_err(|error| format!("server stopped: {error}"))
 }

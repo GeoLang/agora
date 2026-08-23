@@ -33,7 +33,8 @@ pub const AGORA_READ_SCOPE: &str = "agora:read";
 pub const AGORA_WRITE_SCOPE: &str = "agora:write";
 
 /// Claims on a platform token. The platform `role` claim is deliberately not
-/// read: authorization comes from the members table for this document.
+/// read: authorization comes from this document's members row and from the
+/// project it names, never from something the token asserts about itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformClaims {
     pub sub: String,
@@ -146,9 +147,13 @@ impl AuthConfig {
         let caller = Caller {
             user_id: claims.sub,
             name,
+            platform_token: None,
         };
         match claims.token_use.as_deref() {
-            None => Ok(VerifiedCaller::Platform(caller)),
+            None => Ok(VerifiedCaller::Platform(Caller {
+                platform_token: Some(PlatformToken(Arc::from(token))),
+                ..caller
+            })),
             Some(TOOL_TOKEN_USE) => {
                 if claims.role.is_some() {
                     return Err(VerificationError::Invalid);
@@ -245,11 +250,36 @@ pub fn capability_token_hash(token: &str) -> String {
 }
 
 /// A verified platform caller. Holding one is proof the signature and `exp`
-/// checked out, nothing more: document access is still a members lookup.
+/// checked out, nothing more: document access is still a role lookup.
 #[derive(Debug, Clone)]
 pub struct Caller {
     pub user_id: String,
     pub name: String,
+    /// The caller's own token, kept so ptolemy can be asked what they may do
+    /// with their credential rather than one of agora's.
+    ///
+    /// `None` for a scoped tool token: that token was minted to reach agora, and
+    /// forwarding it to another service would spend it somewhere it was never
+    /// scoped for. A tool caller keeps their members table role alone.
+    pub platform_token: Option<PlatformToken>,
+}
+
+/// A bearer token held only long enough to make one call with it.
+#[derive(Clone)]
+pub struct PlatformToken(Arc<str>);
+
+impl PlatformToken {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Redacted for the same reason [`AuthConfig`] is: a stray `{:?}` must not put a
+/// working credential in a log line.
+impl std::fmt::Debug for PlatformToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PlatformToken(redacted)")
+    }
 }
 
 pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -463,6 +493,25 @@ mod tests {
         let token = sign(&json!({"sub": "user-1", "exp": future(), "role": "viewer"}));
         assert!(config.verify_for_scope(&token, AGORA_READ_SCOPE).is_ok());
         assert!(config.verify_for_scope(&token, AGORA_WRITE_SCOPE).is_ok());
+    }
+
+    #[test]
+    fn only_a_platform_caller_carries_a_token_and_no_debug_line_prints_it() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        let token = sign(&json!({"sub": "user-1", "exp": future()}));
+        let caller = config.verify_platform(&token).unwrap();
+        let carried = caller.platform_token.as_ref().unwrap();
+        assert_eq!(carried.as_str(), token);
+        assert!(!format!("{caller:?}").contains(&token));
+
+        let tool = sign(&json!({
+            "sub": "user-1",
+            "exp": future(),
+            "token_use": "tool",
+            "scope": [AGORA_WRITE_SCOPE]
+        }));
+        let tool_caller = config.verify_for_scope(&tool, AGORA_WRITE_SCOPE).unwrap();
+        assert!(tool_caller.platform_token.is_none());
     }
 
     #[test]
