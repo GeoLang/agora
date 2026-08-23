@@ -3227,6 +3227,38 @@ async fn stub_project(
     }
 }
 
+/// A stand in for ptolemy's project listing, which agora asks once per document
+/// listing. Answers from the same role map the single project route reads, so a
+/// test grants a role in one place.
+async fn stub_projects(
+    axum::extract::State(state): axum::extract::State<StubState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    let (status, delay, roles) = {
+        let behaviour = state.behaviour.lock().expect("stub behaviour");
+        (behaviour.status, behaviour.delay, behaviour.roles.clone())
+    };
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    if let Some(status) = status {
+        let status = axum::http::StatusCode::from_u16(status).expect("a status code");
+        return (status, "the stub was told to refuse").into_response();
+    }
+    let Some(subject) = bearer_subject(&headers) else {
+        return (axum::http::StatusCode::UNAUTHORIZED, "no usable bearer").into_response();
+    };
+    let listed: Vec<Value> = roles
+        .iter()
+        .filter(|((_, user), _)| *user == subject)
+        .map(|((project_id, _), role)| json!({"id": project_id, "role": role}))
+        .collect();
+    axum::Json(listed).into_response()
+}
+
 async fn spawn_ptolemy_stub() -> PtolemyStub {
     let state = StubState {
         behaviour: Arc::new(Mutex::new(StubBehaviour::default())),
@@ -3235,6 +3267,7 @@ async fn spawn_ptolemy_stub() -> PtolemyStub {
     // exactly the pinned path and nothing else, so a resolver asking elsewhere
     // gets a 404 and every project test fails
     let router = axum::Router::new()
+        .route("/api/v1/projects", axum::routing::get(stub_projects))
         .route(
             "/api/v1/projects/{project_id}",
             axum::routing::get(stub_project),
@@ -3922,5 +3955,137 @@ async fn a_redirecting_ptolemy_grants_nothing() {
         elsewhere.calls(),
         0,
         "the caller's token was carried to the redirect target"
+    );
+}
+
+/// The listing as the caller sees it: document id and the role it reports.
+async fn listed_documents(app: &TestApp, token: &str) -> Vec<(Uuid, String)> {
+    let response = app
+        .client
+        .get(format!("{}/documents", app.http_base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list documents");
+    assert_eq!(response.status(), 200);
+    let body: Vec<Value> = response.json().await.expect("json body");
+    body.iter()
+        .map(|entry| {
+            (
+                entry["id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .expect("a document id"),
+                entry["role"].as_str().expect("a role").to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_project_member_finds_a_linked_document_in_their_listing() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let editor = fresh_user();
+    let viewer = fresh_user();
+    let outsider = fresh_user();
+    stub.grant(project_id, &owner, "owner");
+    stub.grant(project_id, &editor, "editor");
+    stub.grant(project_id, &viewer, "viewer");
+    let owner_token = platform_token(&owner);
+
+    let document_id =
+        create_document_in_project(&app, &owner_token, "shared by project", project_id).await;
+
+    // neither of them has a members row: the project link is the whole reason
+    assert_eq!(
+        member_roles(&app, &owner_token, document_id).await,
+        vec![(owner.clone(), "edit".to_string())]
+    );
+    assert_eq!(
+        listed_documents(&app, &platform_token(&editor)).await,
+        vec![(document_id, "edit".to_string())]
+    );
+    assert_eq!(
+        listed_documents(&app, &platform_token(&viewer)).await,
+        vec![(document_id, "view".to_string())]
+    );
+    assert_eq!(listed_documents(&app, &platform_token(&outsider)).await, []);
+}
+
+#[tokio::test]
+async fn a_listing_holds_a_document_once_at_the_wider_of_its_two_roles() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let member = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &member, "editor");
+    let owner_token = platform_token(&owner);
+
+    let document_id =
+        create_document_in_project(&app, &owner_token, "both ways in", project_id).await;
+    // a members row on top of the project role must not list the document twice
+    set_member(&app, &owner_token, document_id, &member, "view").await;
+
+    assert_eq!(
+        listed_documents(&app, &platform_token(&member)).await,
+        vec![(document_id, "edit".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn a_listing_asks_ptolemy_once_however_many_documents_it_holds() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let editor = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &editor, "editor");
+    let owner_token = platform_token(&owner);
+
+    for name in ["first", "second", "third"] {
+        create_document_in_project(&app, &owner_token, name, project_id).await;
+    }
+
+    let before = stub.calls();
+    assert_eq!(
+        listed_documents(&app, &platform_token(&editor)).await.len(),
+        3
+    );
+    assert_eq!(stub.calls() - before, 1);
+}
+
+#[tokio::test]
+async fn a_listing_falls_back_to_the_members_table_when_ptolemy_says_nothing() {
+    let stub = spawn_ptolemy_stub().await;
+    let app = spawn_app_with_projects(&stub).await;
+    let project_id = Uuid::new_v4();
+    let owner = fresh_user();
+    let editor = fresh_user();
+    stub.grant(project_id, &owner, "editor");
+    stub.grant(project_id, &editor, "editor");
+    let owner_token = platform_token(&owner);
+    let editor_token = platform_token(&editor);
+
+    let linked = create_document_in_project(&app, &owner_token, "linked", project_id).await;
+    let own = create_document(&app, &editor_token, "their own").await;
+    assert_eq!(listed_documents(&app, &editor_token).await.len(), 2);
+
+    stub.answer_with(500);
+    tokio::time::sleep(TEST_CACHE_TTL * 2).await;
+
+    // the project half is gone, the members row is not
+    assert_eq!(
+        listed_documents(&app, &editor_token).await,
+        vec![(own, "edit".to_string())]
+    );
+    assert_eq!(
+        listed_documents(&app, &owner_token).await,
+        vec![(linked, "edit".to_string())]
     );
 }

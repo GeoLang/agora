@@ -4,6 +4,15 @@
 
 ### Added
 
+- 2026-08-23: **`GET /documents` lists what a project role reaches**. A caller
+  who has no members row on a document but holds a role on the project it is
+  linked to now finds it in their listing, at the wider of the two roles and
+  once. The project half is resolved with one call to
+  `GET {PTOLEMY_URL}/api/v1/projects` for the whole listing, so it is bounded by
+  how many projects the caller belongs to rather than by how many documents are
+  listed. No answer from ptolemy leaves the members table as the only authority,
+  as everywhere else.
+
 - 2026-08-23: **project roles reach documents**. A document can name a ptolemy
   project (`project_id`, migration 007), and a caller's role on that project
   counts on the document: `viewer` reads, `editor` and `owner` edit. It is the

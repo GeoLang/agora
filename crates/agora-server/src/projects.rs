@@ -20,9 +20,15 @@ pub const PROJECT_ROLE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// role alone, so a stalled ptolemy cannot hold agora's request open.
 pub const PTOLEMY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Bytes of a ptolemy response read before it is refused. The body is a handful
-/// of json fields, so anything larger is a wrong url rather than an answer.
+/// Bytes of a single project's response read before it is refused. The body is a
+/// handful of json fields, so anything larger is a wrong url rather than an
+/// answer.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Bytes of the caller's project listing read before it is refused. One entry
+/// runs a few hundred bytes and the list grows with how many projects one person
+/// belongs to, so the cap is far above the single project one.
+const MAX_PROJECT_LIST_BYTES: usize = 1024 * 1024;
 
 /// Cached roles kept before expired ones are dropped. A bound, not a policy: the
 /// map is only an optimisation, so emptying it costs one ptolemy call per caller.
@@ -198,6 +204,40 @@ impl ProjectAccess {
         }
     }
 
+    /// Every project the caller belongs to, with the role each one grants.
+    ///
+    /// One call for the whole set rather than one per document: a listing that
+    /// asked per document would let any signed in caller drive a ptolemy request
+    /// for every project that holds a document, not just their own.
+    ///
+    /// An empty answer where ptolemy did not answer, so a listing falls back to
+    /// the members table the way every other check does.
+    pub async fn caller_projects(&self, token: &PlatformToken) -> Vec<(Uuid, ProjectRole)> {
+        let url = format!("{}/api/v1/projects", self.base_url);
+        let Ok(response) = self
+            .client
+            .get(&url)
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !response.status().is_success() {
+            return Vec::new();
+        }
+        let Some(body) = read_capped_body(response, MAX_PROJECT_LIST_BYTES).await else {
+            return Vec::new();
+        };
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return Vec::new();
+        };
+        let Some(entries) = body.as_array() else {
+            return Vec::new();
+        };
+        entries.iter().filter_map(project_entry).collect()
+    }
+
     /// The caller's role on a project, asked fresh every time.
     ///
     /// This is the check that authorizes pointing a document at a project, so it
@@ -278,7 +318,7 @@ impl ProjectAccess {
                 Answer::Unsettled
             };
         }
-        let Some(body) = read_capped_body(response).await else {
+        let Some(body) = read_capped_body(response, MAX_RESPONSE_BYTES).await else {
             return Answer::Unsettled;
         };
         let Ok(body) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -321,12 +361,20 @@ fn grant_of(role: Option<ProjectRole>) -> ProjectGrant {
     }
 }
 
-/// The body, or `None` once it passes [`MAX_RESPONSE_BYTES`]. Read chunk by
-/// chunk so a wrong url streaming without end cannot be buffered whole.
-async fn read_capped_body(mut response: reqwest::Response) -> Option<Vec<u8>> {
+/// One entry of the project listing, dropped when it carries no readable id and
+/// role. A project agora cannot read grants nothing rather than everything.
+fn project_entry(entry: &serde_json::Value) -> Option<(Uuid, ProjectRole)> {
+    let id = entry.get("id")?.as_str()?.parse().ok()?;
+    let role = ProjectRole::parse(entry.get("role")?.as_str()?)?;
+    Some((id, role))
+}
+
+/// The body, or `None` once it passes `cap`. Read chunk by chunk so a wrong url
+/// streaming without end cannot be buffered whole.
+async fn read_capped_body(mut response: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.ok()? {
-        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+        if body.len() + chunk.len() > cap {
             return None;
         }
         body.extend_from_slice(&chunk);

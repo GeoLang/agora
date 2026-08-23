@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -10,7 +12,7 @@ use crate::AppState;
 use crate::auth::Caller;
 use crate::error::ApiError;
 use crate::limits::MAX_USER_ID_BYTES;
-use crate::projects::{ProjectGrant, widest_role};
+use crate::projects::{ProjectGrant, ProjectRole, widest_role};
 use crate::role::DocumentRole;
 use crate::state::{DocumentState, valid_document_name};
 
@@ -215,23 +217,56 @@ pub struct DocumentSummary {
     created_at: OffsetDateTime,
 }
 
+/// Every project the caller belongs to, keyed by id, or empty when there is no
+/// resolver, no platform token, or no answer from ptolemy. Empty leaves the
+/// members table as the only authority, which is where every other check lands
+/// in the same conditions.
+async fn caller_project_roles(state: &AppState, caller: &Caller) -> HashMap<Uuid, ProjectRole> {
+    let Some(projects) = state.projects.as_deref() else {
+        return HashMap::new();
+    };
+    let Some(token) = caller.platform_token.as_ref() else {
+        return HashMap::new();
+    };
+    projects.caller_projects(token).await.into_iter().collect()
+}
+
+/// The documents the caller reaches, by a members row or by a role on the
+/// project a document is linked to.
+///
+/// The project half is resolved once for the whole listing rather than per
+/// document, so the ptolemy calls this makes are bounded by how many projects
+/// the caller belongs to.
 pub async fn list_documents(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Result<Json<Vec<DocumentSummary>>, ApiError> {
+    let project_roles = caller_project_roles(&state, &caller).await;
+    let project_ids: Vec<Uuid> = project_roles.keys().copied().collect();
+
     let rows = sqlx::query(
-        "select d.id, d.name, d.created_at, m.role
-         from documents d join members m on m.doc_id = d.id
-         where m.user_id = $1 order by d.created_at desc",
+        "select d.id, d.name, d.created_at, d.project_id, m.role as member_role
+         from documents d
+         left join members m on m.doc_id = d.id and m.user_id = $1
+         where m.user_id is not null or d.project_id = any($2)
+         order by d.created_at desc",
     )
     .bind(&caller.user_id)
+    .bind(&project_ids)
     .fetch_all(&state.pool)
     .await?;
 
     let mut summaries = Vec::with_capacity(rows.len());
     for row in rows {
-        let role: String = row.try_get("role")?;
-        let Some(role) = DocumentRole::parse(&role) else {
+        let member_role: Option<String> = row.try_get("member_role")?;
+        let member_role = member_role.as_deref().and_then(DocumentRole::parse);
+        let project_id: Option<Uuid> = row.try_get("project_id")?;
+        let grant = project_id
+            .and_then(|id| project_roles.get(&id))
+            .map_or_else(ProjectGrant::none, |role| {
+                ProjectGrant::of(role.document_role())
+            });
+        let Some(role) = widest_role(member_role, grant) else {
             continue;
         };
         summaries.push(DocumentSummary {
