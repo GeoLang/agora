@@ -14,7 +14,7 @@ use crate::error::ApiError;
 use crate::limits::MAX_USER_ID_BYTES;
 use crate::projects::{ProjectGrant, ProjectRole, widest_role};
 use crate::role::DocumentRole;
-use crate::state::{DocumentState, valid_document_name};
+use crate::state::{DocumentState, valid_name};
 
 /// The caller's row in the members table, or `None` when they have none. An
 /// unreadable role denies access rather than defaulting to one.
@@ -170,7 +170,7 @@ pub async fn create_document(
     Json(request): Json<CreateDocumentRequest>,
 ) -> Result<(StatusCode, Json<CreatedDocument>), ApiError> {
     let name = request.name.trim().to_string();
-    if !valid_document_name(&name) {
+    if !valid_name(&name) {
         return Err(ApiError::bad_request("invalid document name"));
     }
     if let Some(project_id) = request.project_id {

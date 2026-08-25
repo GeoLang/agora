@@ -4089,3 +4089,260 @@ async fn a_listing_falls_back_to_the_members_table_when_ptolemy_says_nothing() {
         vec![(linked, "edit".to_string())]
     );
 }
+
+async fn create_feed(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    name: &str,
+    interval_seconds: i64,
+) -> reqwest::Response {
+    app.client
+        .post(format!("{}/documents/{document_id}/feeds", app.http_base))
+        .bearer_auth(token)
+        .json(&json!({"name": name, "intervalSeconds": interval_seconds}))
+        .send()
+        .await
+        .expect("create feed")
+}
+
+/// Register a feed and keep both halves of the reply a producer needs.
+async fn feed_credential(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    interval_seconds: i64,
+) -> (Uuid, String) {
+    let response = create_feed(app, token, document_id, "sensors", interval_seconds).await;
+    assert_eq!(response.status(), 201);
+    let body: Value = response.json().await.expect("json body");
+    (
+        body["id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .expect("a feed id"),
+        body["token"].as_str().expect("a feed token").to_string(),
+    )
+}
+
+async fn list_feeds(app: &TestApp, token: &str, document_id: Uuid) -> reqwest::Response {
+    app.client
+        .get(format!("{}/documents/{document_id}/feeds", app.http_base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list feeds")
+}
+
+async fn delete_feed(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    feed_id: Uuid,
+) -> reqwest::Response {
+    app.client
+        .delete(format!(
+            "{}/documents/{document_id}/feeds/{feed_id}",
+            app.http_base
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("delete feed")
+}
+
+#[tokio::test]
+async fn an_editor_registers_a_feed_lists_it_and_deletes_it() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "twins").await;
+
+    let response = create_feed(&app, &owner_token, document_id, "roof sensors", 5).await;
+    assert_eq!(response.status(), 201);
+    let created: Value = response.json().await.expect("json body");
+    assert_eq!(created["name"], "roof sensors");
+    assert_eq!(created["intervalSeconds"], 5);
+    let feed_id = Uuid::parse_str(created["id"].as_str().expect("a feed id")).expect("a uuid");
+    assert!(
+        created["token"].as_str().expect("a token").len() > 20,
+        "no feed token came back"
+    );
+
+    let listed: Value = list_feeds(&app, &owner_token, document_id)
+        .await
+        .json()
+        .await
+        .expect("json");
+    let listed = listed.as_array().expect("an array").clone();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], created["id"]);
+    assert_eq!(listed[0]["name"], "roof sensors");
+    assert_eq!(listed[0]["intervalSeconds"], 5);
+    assert_eq!(listed[0]["createdBy"], owner.as_str());
+    assert!(
+        time::OffsetDateTime::parse(
+            listed[0]["createdAt"].as_str().expect("a timestamp"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok(),
+        "createdAt is not rfc 3339"
+    );
+    assert!(
+        listed[0].get("token").is_none(),
+        "the listing handed the feed token back"
+    );
+
+    assert_eq!(
+        delete_feed(&app, &owner_token, document_id, feed_id)
+            .await
+            .status(),
+        204
+    );
+    let listed: Value = list_feeds(&app, &owner_token, document_id)
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert!(listed.as_array().expect("an array").is_empty());
+}
+
+#[tokio::test]
+async fn only_an_editor_registers_or_deletes_a_feed() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "twins").await;
+    let viewer = fresh_user();
+    set_member(&app, &owner_token, document_id, &viewer, "view").await;
+    let viewer_token = platform_token(&viewer);
+    let (feed_id, _) = feed_credential(&app, &owner_token, document_id, 5).await;
+
+    assert_eq!(
+        create_feed(&app, &viewer_token, document_id, "sneaky", 5)
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        delete_feed(&app, &viewer_token, document_id, feed_id)
+            .await
+            .status(),
+        403
+    );
+    // a viewer still reads the listing
+    assert_eq!(
+        list_feeds(&app, &viewer_token, document_id).await.status(),
+        200
+    );
+
+    let stranger_token = platform_token(&fresh_user());
+    assert_eq!(
+        create_feed(&app, &stranger_token, document_id, "sneaky", 5)
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        list_feeds(&app, &stranger_token, document_id)
+            .await
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_feed_on_another_document_is_not_found() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let mine = create_document(&app, &owner_token, "mine").await;
+    let other = create_document(&app, &owner_token, "other").await;
+    let (feed_id, _) = feed_credential(&app, &owner_token, mine, 5).await;
+
+    assert_eq!(
+        delete_feed(&app, &owner_token, other, feed_id)
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        delete_feed(&app, &owner_token, mine, Uuid::new_v4())
+            .await
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_feed_name_and_interval_are_bounded() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "twins").await;
+
+    for (name, interval) in [
+        ("", 5),
+        ("   ", 5),
+        ("line\nbreak", 5),
+        ("ok", 0),
+        ("ok", -1),
+        ("ok", 3601),
+    ] {
+        assert_eq!(
+            create_feed(&app, &owner_token, document_id, name, interval)
+                .await
+                .status(),
+            400,
+            "{name:?} at {interval}"
+        );
+    }
+    let too_long = "a".repeat(MAX_DOCUMENT_NAME_BYTES + 1);
+    assert_eq!(
+        create_feed(&app, &owner_token, document_id, &too_long, 5)
+            .await
+            .status(),
+        400
+    );
+    assert_eq!(
+        create_feed(&app, &owner_token, document_id, "ok", 3600)
+            .await
+            .status(),
+        201
+    );
+}
+
+#[tokio::test]
+async fn a_feed_token_is_refused_everywhere_a_caller_is_expected() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "twins").await;
+    let (_, feed_token) = feed_credential(&app, &owner_token, document_id, 5).await;
+
+    assert_eq!(
+        get_document(&app, &feed_token, document_id).await.status(),
+        401
+    );
+    assert_eq!(
+        list_feeds(&app, &feed_token, document_id).await.status(),
+        401
+    );
+    assert_eq!(
+        create_feed(&app, &feed_token, document_id, "another", 5)
+            .await
+            .status(),
+        401
+    );
+    assert_eq!(
+        app.client
+            .get(format!("{}/documents", app.http_base))
+            .bearer_auth(&feed_token)
+            .send()
+            .await
+            .expect("list documents")
+            .status(),
+        401
+    );
+    assert_eq!(
+        handshake_status(connect_with_subprotocol(&app, document_id, &feed_token, None).await),
+        Some(401),
+        "a feed token opened the document socket"
+    );
+}

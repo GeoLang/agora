@@ -65,6 +65,39 @@ pub const ATTACHMENT_GRACE_DAYS: i64 = 7;
 /// How often the sweep looks for attachments nothing points at.
 pub const ATTACHMENT_SWEEP_INTERVAL_HOURS: u64 = 6;
 
+/// Longest accepted asset id or reading kind, bytes. Both are opaque ids a
+/// sensor feed chooses, and agora has no asset directory, so a length bound is
+/// the only check there is.
+pub const MAX_ASSET_ID_BYTES: usize = 128;
+
+/// Readings in one ingest frame. A larger frame could never be accepted anyway,
+/// since the rate limiter charges a frame per reading.
+pub const MAX_FEED_READINGS_PER_FRAME: usize = 256;
+
+/// Readings allowed per second per ingest connection.
+pub const MAX_FEED_READINGS_PER_SECOND: usize = 200;
+
+/// Shortest and longest reporting interval a feed may declare, seconds.
+pub const MIN_FEED_INTERVAL_SECONDS: i32 = 1;
+pub const MAX_FEED_INTERVAL_SECONDS: i32 = 3600;
+
+/// Lifetime of a feed token, days. A feed is a device that is set up once and
+/// left alone, so the token outlives anyone who would notice it expiring.
+/// Deleting the feed row is what revokes it.
+pub const FEED_TOKEN_LIFETIME_DAYS: i64 = 3650;
+
+/// Reporting intervals an asset may miss before it counts as offline.
+pub const STALE_MISSED_INTERVALS: i64 = 3;
+
+/// How often the loaded rooms are walked for assets that have gone quiet.
+pub const STALE_CHECK_INTERVAL_SECONDS: u64 = 1;
+
+/// How long a reading is kept.
+pub const READINGS_RETENTION_DAYS: i64 = 30;
+
+/// How often the sweep deletes readings past the retention window.
+pub const READINGS_SWEEP_INTERVAL_HOURS: u64 = 1;
+
 /// Notifications one list call returns, newest first.
 pub const NOTIFICATIONS_PAGE_SIZE: i64 = 50;
 
@@ -93,13 +126,20 @@ pub fn oldest_op_to_keep(checkpoint_seq: i64) -> Option<i64> {
 pub struct RateLimiter {
     window_started: Instant,
     seen: usize,
+    cap: usize,
 }
 
 impl RateLimiter {
+    /// A document connection's limiter, charged per op and per presence frame.
     pub fn new() -> Self {
+        Self::with_cap(MAX_CLIENT_MESSAGES_PER_SECOND)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
         Self {
             window_started: Instant::now(),
             seen: 0,
+            cap,
         }
     }
 
@@ -117,7 +157,7 @@ impl RateLimiter {
             self.seen = 0;
         }
         self.seen = self.seen.saturating_add(count);
-        self.seen <= MAX_CLIENT_MESSAGES_PER_SECOND
+        self.seen <= self.cap
     }
 }
 
@@ -152,6 +192,16 @@ mod tests {
         let mut limiter = RateLimiter::new();
         assert!(!limiter.allow_many(MAX_CLIENT_MESSAGES_PER_SECOND + 1));
         assert!(!limiter.allow(), "a refused batch left the budget unspent");
+    }
+
+    #[test]
+    fn a_limiter_charges_against_the_cap_it_was_built_with() {
+        let mut limiter = RateLimiter::with_cap(MAX_FEED_READINGS_PER_SECOND);
+        assert!(limiter.allow_many(MAX_FEED_READINGS_PER_SECOND));
+        assert!(!limiter.allow());
+
+        let mut limiter = RateLimiter::with_cap(MAX_FEED_READINGS_PER_SECOND);
+        assert!(!limiter.allow_many(MAX_FEED_READINGS_PER_SECOND + 1));
     }
 
     #[test]

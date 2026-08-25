@@ -5,6 +5,7 @@ pub mod attachments;
 pub mod auth;
 pub mod documents;
 pub mod error;
+pub mod feeds;
 pub mod limits;
 pub mod links;
 pub mod notifications;
@@ -19,7 +20,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::FromRef;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use sqlx::PgPool;
 use sqlx::migrate::MigrateError;
 use tower_http::cors::CorsLayer;
@@ -93,6 +94,14 @@ pub fn router(state: AppState) -> Router {
             put(documents::set_member).delete(documents::remove_member),
         )
         .route("/documents/{id}/links", post(links::create_link))
+        .route(
+            "/documents/{id}/feeds",
+            post(feeds::create_feed).get(feeds::list_feeds),
+        )
+        .route(
+            "/documents/{id}/feeds/{feed_id}",
+            delete(feeds::delete_feed),
+        )
         .route(
             "/documents/{id}/attachments",
             post(attachments::create_attachment),

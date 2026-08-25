@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::limits::SESSION_TOKEN_LIFETIME_HOURS;
+use crate::limits::{FEED_TOKEN_LIFETIME_DAYS, SESSION_TOKEN_LIFETIME_HOURS};
 use crate::role::DocumentRole;
 
 /// Env var holding the shared HS256 secret.
@@ -29,6 +29,15 @@ pub const MIN_SECRET_LEN: usize = 32;
 /// the other even though both are signed with the same secret.
 pub const SESSION_AUDIENCE: &str = "agora-session";
 const TOOL_TOKEN_USE: &str = "tool";
+
+/// Private claim marking a token as reaching the sensor ingest socket and
+/// nothing else.
+///
+/// A private claim and not an `aud`, because every platform service validates
+/// with `Validation::default()`, which refuses a token carrying any audience at
+/// all. [`AuthConfig::decode_caller`] refuses every token carrying this claim,
+/// so a feed token is not a caller anywhere.
+const FEED_TOKEN_USE: &str = "feed";
 pub const AGORA_READ_SCOPE: &str = "agora:read";
 pub const AGORA_WRITE_SCOPE: &str = "agora:write";
 
@@ -56,6 +65,10 @@ struct TokenClaims {
     token_use: Option<String>,
     #[serde(default)]
     scope: Option<serde_json::Value>,
+    /// Read only to refuse it. Whatever it says, a token scoped to one of
+    /// agora's own sockets is not a caller on any route.
+    #[serde(default)]
+    agora_use: Option<String>,
 }
 
 enum VerifiedCaller {
@@ -80,7 +93,18 @@ pub struct SessionClaims {
     pub link: String,
 }
 
-/// The signing secret both token kinds validate against.
+/// Claims on a feed token. `sub` is the feed's id and `doc` the document it
+/// reports to, both typed as uuids so a token naming anything else fails to
+/// decode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedClaims {
+    pub sub: Uuid,
+    pub exp: usize,
+    pub doc: Uuid,
+    pub agora_use: String,
+}
+
+/// The signing secret every token kind validates against.
 #[derive(Clone)]
 pub struct AuthConfig {
     secret: Arc<str>,
@@ -137,7 +161,7 @@ impl AuthConfig {
         let claims = decode::<TokenClaims>(token, &self.decoding_key(), &Validation::default())
             .map_err(|_| VerificationError::Invalid)?
             .claims;
-        if claims.sub.is_empty() {
+        if claims.sub.is_empty() || claims.agora_use.is_some() {
             return Err(VerificationError::Invalid);
         }
         let name = claims
@@ -223,9 +247,39 @@ impl AuthConfig {
             role,
             link: link_token.to_string(),
         };
+        self.sign(&claims, "could not mint a session token")
+    }
+
+    /// Mint the credential a sensor feed holds. It says nothing about who may
+    /// read the document: the ingest socket is the only thing that takes one,
+    /// and all it can do there is append readings to this one feed.
+    pub fn mint_feed(&self, feed_id: Uuid, document_id: Uuid) -> Result<String, ApiError> {
+        let expires_at = OffsetDateTime::now_utc() + time::Duration::days(FEED_TOKEN_LIFETIME_DAYS);
+        let exp = usize::try_from(expires_at.unix_timestamp())
+            .map_err(|_| ApiError::internal("clock out of range"))?;
+        let claims = FeedClaims {
+            sub: feed_id,
+            exp,
+            doc: document_id,
+            agora_use: FEED_TOKEN_USE.to_string(),
+        };
+        self.sign(&claims, "could not mint a feed token")
+    }
+
+    /// Validate a feed token. The signature, `exp` and the refusal of any `aud`
+    /// come from `Validation::default()`, the same as a platform token. Whether
+    /// the feed still exists is a row lookup the caller makes after this.
+    pub fn verify_feed(&self, token: &str) -> Option<FeedClaims> {
+        let claims = decode::<FeedClaims>(token, &self.decoding_key(), &Validation::default())
+            .ok()?
+            .claims;
+        (claims.agora_use == FEED_TOKEN_USE).then_some(claims)
+    }
+
+    fn sign(&self, claims: &impl Serialize, failure: &'static str) -> Result<String, ApiError> {
         let key = EncodingKey::from_secret(self.secret.as_bytes());
-        encode(&Header::new(Algorithm::HS256), &claims, &key)
-            .map_err(|_| ApiError::internal("could not mint a session token"))
+        encode(&Header::new(Algorithm::HS256), claims, &key)
+            .map_err(|_| ApiError::internal(failure))
     }
 }
 
@@ -556,6 +610,106 @@ mod tests {
             "link": "made-up"
         }));
         assert!(config.verify_session(&forged).is_none());
+    }
+
+    #[test]
+    fn a_feed_token_is_never_a_caller() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        let feed_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let feed = config.mint_feed(feed_id, document_id).unwrap();
+
+        assert!(config.verify_platform(&feed).is_none());
+        assert!(config.verify_session(&feed).is_none());
+        for scope in [AGORA_READ_SCOPE, AGORA_WRITE_SCOPE] {
+            assert!(matches!(
+                config.verify_for_scope(&feed, scope),
+                Err(VerificationError::Invalid)
+            ));
+        }
+
+        let claims = config.verify_feed(&feed).unwrap();
+        assert_eq!(claims.sub, feed_id);
+        assert_eq!(claims.doc, document_id);
+    }
+
+    #[test]
+    fn any_agora_use_at_all_stops_a_token_being_a_caller() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        for claims in [
+            json!({"sub": "user-1", "exp": future(), "agora_use": "feed"}),
+            json!({"sub": "user-1", "exp": future(), "agora_use": "something-later"}),
+            json!({
+                "sub": "user-1",
+                "exp": future(),
+                "agora_use": "feed",
+                "token_use": "tool",
+                "scope": [AGORA_WRITE_SCOPE]
+            }),
+        ] {
+            let token = sign(&claims);
+            assert!(config.verify_platform(&token).is_none(), "{claims}");
+            assert!(matches!(
+                config.verify_for_scope(&token, AGORA_WRITE_SCOPE),
+                Err(VerificationError::Invalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_platform_a_tool_and_a_session_token_are_all_refused_as_feed_tokens() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        let platform = sign(&json!({"sub": "user-1", "exp": future()}));
+        let tool = sign(&json!({
+            "sub": "user-1",
+            "exp": future(),
+            "token_use": "tool",
+            "scope": [AGORA_WRITE_SCOPE]
+        }));
+        let session = config
+            .mint_session(Uuid::new_v4(), DocumentRole::Edit, "link")
+            .unwrap();
+        for token in [platform, tool, session] {
+            assert!(config.verify_feed(&token).is_none());
+        }
+
+        // the right shape signed with the wrong secret, and an expired one
+        let other = AuthConfig::new("ffffffffffffffffffffffffffffffff").unwrap();
+        let feed = config.mint_feed(Uuid::new_v4(), Uuid::new_v4()).unwrap();
+        assert!(other.verify_feed(&feed).is_none());
+        let expired = sign(&json!({
+            "sub": Uuid::new_v4(),
+            "exp": 1_000_000,
+            "doc": Uuid::new_v4(),
+            "agora_use": "feed"
+        }));
+        assert!(config.verify_feed(&expired).is_none());
+    }
+
+    #[test]
+    fn a_feed_token_naming_something_other_than_two_uuids_is_refused() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        for claims in [
+            json!({"sub": "not-a-uuid", "exp": future(), "doc": Uuid::new_v4(), "agora_use": "feed"}),
+            json!({"sub": Uuid::new_v4(), "exp": future(), "doc": "not-a-uuid", "agora_use": "feed"}),
+            json!({"sub": Uuid::new_v4(), "exp": future(), "agora_use": "feed"}),
+            json!({"sub": Uuid::new_v4(), "exp": future(), "doc": Uuid::new_v4()}),
+            json!({
+                "sub": Uuid::new_v4(),
+                "exp": future(),
+                "doc": Uuid::new_v4(),
+                "agora_use": "tool"
+            }),
+            json!({
+                "sub": Uuid::new_v4(),
+                "exp": future(),
+                "doc": Uuid::new_v4(),
+                "agora_use": "feed",
+                "aud": SESSION_AUDIENCE
+            }),
+        ] {
+            assert!(config.verify_feed(&sign(&claims)).is_none(), "{claims}");
+        }
     }
 
     #[test]

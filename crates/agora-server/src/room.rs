@@ -14,7 +14,7 @@ use crate::limits::{
 use crate::notifications::record_comment_mentions;
 use crate::protocol::{AppliedOp, BatchOp, OpValue, Peer, ServerMessage};
 use crate::state::{
-    DocumentState, KeyError, META_NAME_KEY, op_value_within_cap, parse_key, valid_document_name,
+    DocumentState, KeyError, META_NAME_KEY, op_value_within_cap, parse_key, valid_name,
 };
 
 #[derive(Debug)]
@@ -313,7 +313,7 @@ impl Room {
         let Some(name) = value.and_then(Value::as_str) else {
             return Err(OpError::InvalidName);
         };
-        if !valid_document_name(name) {
+        if !valid_name(name) {
             return Err(OpError::InvalidName);
         }
         Ok(Some(name.to_string()))

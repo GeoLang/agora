@@ -5,7 +5,14 @@ use serde_json::{Map, Value};
 use crate::limits::{MAX_DOCUMENT_NAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES};
 
 /// The only namespaces an op key may address.
-pub const NAMESPACES: [&str; 5] = ["meta", "layers", "annotations", "bookmarks", "comments"];
+pub const NAMESPACES: [&str; 6] = [
+    "meta",
+    "layers",
+    "annotations",
+    "bookmarks",
+    "comments",
+    "assets",
+];
 
 /// The one key the server reads rather than passes through.
 pub const META_NAME_KEY: &str = "meta/name";
@@ -49,9 +56,9 @@ pub fn parse_key(key: &str) -> Result<(&str, &str), KeyError> {
     Ok((namespace, id))
 }
 
-/// A document name a client may set, either at creation or through
-/// `meta/name`.
-pub fn valid_document_name(name: &str) -> bool {
+/// A name a client may set: a document's, at creation or through `meta/name`,
+/// or a feed's.
+pub fn valid_name(name: &str) -> bool {
     !name.trim().is_empty()
         && name.len() <= MAX_DOCUMENT_NAME_BYTES
         && !name.chars().any(char::is_control)
@@ -196,6 +203,7 @@ mod tests {
             Ok(("annotations", "x-1_2.3"))
         );
         assert_eq!(parse_key("bookmarks/b"), Ok(("bookmarks", "b")));
+        assert_eq!(parse_key("assets/rule"), Ok(("assets", "rule")));
         assert_eq!(
             parse_key("comments/018f2c1a-6d3b-7e42-9c10-5a8b7d2e4f16"),
             Ok(("comments", "018f2c1a-6d3b-7e42-9c10-5a8b7d2e4f16"))
@@ -224,15 +232,13 @@ mod tests {
     }
 
     #[test]
-    fn document_names_are_bounded_and_printable() {
-        assert!(valid_document_name("city plan"));
-        assert!(!valid_document_name(""));
-        assert!(!valid_document_name("   "));
-        assert!(!valid_document_name("line\nbreak"));
-        assert!(!valid_document_name(
-            &"a".repeat(MAX_DOCUMENT_NAME_BYTES + 1)
-        ));
-        assert!(valid_document_name(&"a".repeat(MAX_DOCUMENT_NAME_BYTES)));
+    fn names_are_bounded_and_printable() {
+        assert!(valid_name("city plan"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("   "));
+        assert!(!valid_name("line\nbreak"));
+        assert!(!valid_name(&"a".repeat(MAX_DOCUMENT_NAME_BYTES + 1)));
+        assert!(valid_name(&"a".repeat(MAX_DOCUMENT_NAME_BYTES)));
     }
 
     #[test]
@@ -240,7 +246,7 @@ mod tests {
         let state = DocumentState::new("plan");
         let snapshot = state.snapshot();
         assert_eq!(snapshot["meta"]["name"], json!("plan"));
-        for namespace in ["layers", "annotations", "bookmarks", "comments"] {
+        for namespace in ["layers", "annotations", "bookmarks", "comments", "assets"] {
             assert!(snapshot[namespace].is_object(), "{namespace}");
             assert_eq!(snapshot[namespace].as_object().unwrap().len(), 0);
         }
