@@ -78,16 +78,21 @@ sqlx's `prefer`, which is a plaintext connection when the server offers no TLS.
   "layers": {"roads": {"order": "a0", "...": "..."}},
   "annotations": {},
   "bookmarks": {},
-  "comments": {}
+  "comments": {},
+  "assets": {"rule": {"...": "..."}}
 }
 ```
 
 A layer's `order` is a client convention, a fractional index string, so a reorder
 is a write to one key rather than a rewrite of the list. The server neither reads
 nor validates it: op validation covers the key shape and the value size and
-nothing else. Layer, annotation, bookmark and comment
+nothing else. Layer, annotation, bookmark, comment and asset
 values are opaque JSON to the server. Only `meta/name` has server meaning: it has
 to be a string within the name cap, and it also updates the document row.
+
+`assets` holds how a client turns sensor readings into what is drawn on the map,
+under whatever keys it likes. Readings themselves are not document state: they
+arrive on the ingest socket and are served by the asset routes below.
 
 A comment thread is flat: a reply is its own key carrying its parent's id, and
 the client groups them. The server enforces no authorship, so any editor can
@@ -121,6 +126,11 @@ anything else.
 | `DELETE /documents/{id}/members/{userId}` | Removes a member, edit role only. |
 | `POST /documents/{id}/links` `{"role": "view"\|"edit"}` | Mints a share link, edit role only. Returns `{"token": "..."}`. |
 | `POST /documents/{id}/attachments` | Stores one image against the document, edit role only. Raw body, `Content-Type` header. Returns `{"token": "...", "url": "/attachments/..."}`. |
+| `POST /documents/{id}/feeds` `{"name": "...", "intervalSeconds": 5}` | Registers a sensor feed, edit role only. Returns `{"id", "name", "intervalSeconds", "token"}`, and the token appears here and nowhere else. |
+| `GET /documents/{id}/feeds` | The document's feeds: `{"id", "name", "intervalSeconds", "createdBy", "createdAt"}`. Never the token. |
+| `DELETE /documents/{id}/feeds/{feedId}` | Revokes a feed and deletes its readings, edit role only. |
+| `GET /documents/{id}/assets` | What every asset the document's feeds report is doing now. |
+| `GET /documents/{id}/assets/at?t=<rfc3339>` | The same as of `t`. A missing or unparsable `t` is a 400. |
 | `GET /attachments/{token}` | Reads an attachment. No credential beyond the token. |
 | `DELETE /links/{token}` | Revokes a share link, edit role only. |
 | `GET /links/{token}` | Resolves a link to `{"doc": "...", "role": "...", "sessionToken": "..."}`. |
@@ -204,6 +214,82 @@ attachment that is already past its grace period, so a document with no
 attachments and a document whose attachments were confirmed recently both cost
 nothing.
 
+## Feeds
+
+A feed is a sensor source reporting to one document. An editor registers it with
+`POST /documents/{id}/feeds`, naming how often it reports, and gets a token back.
+That reply is the only place the token exists: nothing stores it, and a lost one
+is replaced by deleting the feed and registering another.
+
+```
+POST /documents/{id}/feeds
+Authorization: Bearer <platform jwt>
+
+{"name": "roof sensors", "intervalSeconds": 5}
+```
+
+The token is an HS256 JWT signed with the platform secret, carrying the feed id
+as `sub`, the document as `doc` and `agora_use: "feed"`. It reaches the ingest
+socket and nothing else: every other route and `/ws` refuse any token carrying
+`agora_use` at all, so it is not a caller anywhere and grants no read of the
+document. Deleting the feed row revokes it, since the ingest socket checks that
+the feed still exists and is still on the document the token names.
+
+### Ingesting readings
+
+`GET /feeds/ws`, with the feed token offered the same way `/ws` takes one:
+
+```js
+new WebSocket(`${base}/feeds/ws`, ["bearer", feedToken])
+```
+
+```json
+{"type": "readings", "readings": [{"asset": "TWIN-03", "kind": "temperature", "value": 21.5, "at": "2026-08-25T12:00:00Z"}]}
+```
+
+`at` is optional and defaults to when the server took the frame, which is what a
+device with no clock relies on. `asset` and `kind` are opaque ids the feed
+chooses, carrying no whitespace and no control characters. `value` is a finite
+number.
+
+An accepted frame answers `{"type": "ack", "count": 5}`, counting the readings
+it carried, and goes out to everyone on the document as a `readings` frame. A
+reading that repeats one already stored is dropped, so a feed replaying after a
+reconnect costs nothing.
+
+Anything refused answers `{"type": "error", "reason": "..."}` and closes the
+connection, unlike the document socket, which stays open. A feed is a device
+rather than a person: whatever it is sending it will keep sending, so the
+refusal has to reach the code that reconnects. Deleting the feed while a socket
+is open closes it on its next frame with `feed revoked`.
+
+### Assets
+
+An asset is whatever `asset` ids the readings carry. `GET /documents/{id}/assets`
+answers with the latest reading of every kind per asset:
+
+```json
+{"assets": [{"asset": "TWIN-03", "feed": "...", "online": true, "values": [{"kind": "temperature", "value": 21.5, "at": "2026-08-25T12:00:00Z"}]}]}
+```
+
+`GET /documents/{id}/assets/at?t=<rfc3339>` answers the same shape as of `t`:
+every value the latest at or before it, and `online` judged against it rather
+than against now.
+
+An asset is online while its newest reading of any kind is at or after now minus
+three times its feed's interval. Three missed reports, so a single late one is
+not an outage. When an asset crosses that line the room sends
+`{"type": "liveness", "asset": "...", "online": false, "at": "..."}`, and the
+next reading sends the same frame with `online: true`. The check runs once a
+second over the documents somebody has open. A document nobody is looking at is
+not checked, since there is nobody to tell, and its assets are judged again the
+next time somebody joins.
+
+Readings are kept for 30 days, and a sweep deletes what is older every hour.
+Nothing caps how many feeds a document holds or how many assets a feed reports,
+so the rate limit and the retention window are the only bounds on how many rows
+a feed can write.
+
 ## Websocket
 
 `GET /ws?doc=<id>` and optionally `&since=<seq>`.
@@ -226,10 +312,13 @@ logs a request url.
 The token is either a platform JWT of a member of the document or a
 `sessionToken` from a share link on that document.
 
-On connect the server sends either a `snapshot` or the ops after `since`, and
-then `peers`. `peers` always ends the join sequence, so a client knows it is
-caught up when `peers` arrives. Ops after `since` are replayed only while the
-retained tail still reaches back that far, otherwise the client gets a snapshot.
+On connect the server sends either a `snapshot` or the ops after `since`, then
+`assets`, then `peers`. `peers` always ends the join sequence, so a client knows
+it is caught up when `peers` arrives. Ops after `since` are replayed only while
+the retained tail still reaches back that far, otherwise the client gets a
+snapshot. `assets` goes out on every join, a resume that missed nothing
+included, because asset state is not carried by ops and cannot be replayed from
+the tail.
 
 ### Client to server
 
@@ -252,8 +341,8 @@ same as two separate ops. One `clientSeq` covers the batch and one `ack` answers
 it.
 
 Keys are `<namespace>/<id>` where the namespace is one of `meta`, `layers`,
-`annotations`, `bookmarks` or `comments`, and the id is letters, digits, `-`, `_`
-or `.`. Anything else is refused.
+`annotations`, `bookmarks`, `comments` or `assets`, and the id is letters,
+digits, `-`, `_` or `.`. Anything else is refused.
 
 ### Server to client
 
@@ -264,8 +353,15 @@ or `.`. Anything else is refused.
 {"type": "ack", "clientSeq": 4, "seq": 13}
 {"type": "peers", "peers": [{"actor": "user-1", "name": "Ada", "role": "edit"}]}
 {"type": "presence", "actor": "user-1", "cursor": [12.5, -3.25], "selection": [], "viewport": null}
+{"type": "readings", "feed": "...", "readings": [{"asset": "TWIN-03", "kind": "temperature", "value": 21.5, "at": "2026-08-25T12:00:00Z"}]}
+{"type": "assets", "assets": [{"asset": "TWIN-03", "feed": "...", "online": true, "values": [{"kind": "temperature", "value": 21.5, "at": "2026-08-25T12:00:00Z"}]}]}
+{"type": "liveness", "asset": "TWIN-03", "online": false, "at": "2026-08-25T12:00:16Z"}
 {"type": "error", "reason": "edit role required"}
 ```
+
+`readings`, `assets` and `liveness` carry no `seq` and are not ops. They come
+from the feeds on the document, described under Feeds above, and `assets` holds
+the same JSON as `GET /documents/{id}/assets`.
 
 `peers` goes out on every join and leave. A refused message is an `error` and the
 connection stays open, unless the credential itself is the problem, which is a
@@ -318,9 +414,15 @@ one is an `error` message or a 4xx, never a panic.
 | Member user id | 128 bytes |
 | Document state | 4 MiB, measured as the sum over stored keys of the key length plus the JSON length of its value |
 | Attachment | 16 MiB, refused while the body is still arriving |
+| Feed name | 200 bytes, the same as a document name |
+| Feed interval | 1 to 3600 seconds |
+| Asset id and reading kind | 128 bytes each |
+| Readings in one ingest frame | 256 |
+| Readings per ingest connection | 200 per second, so a frame at the 256 cap is refused by the rate limit first |
 
 Share link tokens are 128 random bits and attachment tokens 256, url safe.
-Session tokens expire after 12 hours.
+Session tokens expire after 12 hours and feed tokens after ten years, since a
+feed is set up once and revoked by deleting its row rather than by expiry.
 
 The database stores only the SHA-256 of a share link or attachment token, so a
 database read hands over no working link and no working attachment url. The raw
@@ -335,7 +437,8 @@ immediately.
 
 ## Storage
 
-Attachment bytes sit in Postgres beside everything else, in `attachments`.
+Attachment bytes sit in Postgres beside everything else, in `attachments`, and
+sensor readings in `readings`, keyed by feed, asset, kind and time.
 
 Ops are appended to `ops` and folded into `documents.checkpoint` every 256 ops
 after the last fold (`seq - checkpoint_seq`). The fold and the prune run in one

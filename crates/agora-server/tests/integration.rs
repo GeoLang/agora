@@ -8,7 +8,7 @@ use agora_server::limits::{
     ATTACHMENT_GRACE_DAYS, MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND,
     MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_FEED_READINGS_PER_FRAME,
     MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT,
-    MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
+    MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES, READINGS_RETENTION_DAYS,
 };
 use agora_server::projects::ProjectAccess;
 use agora_server::protocol::{BatchOp, OpValue, Peer};
@@ -4834,4 +4834,110 @@ async fn a_join_after_readings_gets_the_assets_before_the_peers() {
     assert_eq!(asset["online"], true);
     assert_eq!(value_of(asset, "temperature")["value"], 21.5);
     client.expect_message("peers").await;
+}
+
+/// Readings written straight into the table at a chosen age, which is how a
+/// retention test gets old rows without waiting for them.
+async fn age_readings(app: &TestApp, feed_id: Uuid, asset: &str, days_ago: i64) {
+    sqlx::query(
+        "insert into readings (feed_id, asset_id, kind, at, value)
+         values ($1, $2, 'temperature', now() - make_interval(days => $3::int), 1.0)",
+    )
+    .bind(feed_id)
+    .bind(asset)
+    .bind(i32::try_from(days_ago).expect("a day count"))
+    .execute(&app.state.pool)
+    .await
+    .expect("insert an aged reading");
+}
+
+async fn stored_assets(app: &TestApp, feed_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar("select asset_id from readings where feed_id = $1 order by asset_id")
+        .bind(feed_id)
+        .fetch_all(&app.state.pool)
+        .await
+        .expect("read back the readings")
+}
+
+#[tokio::test]
+async fn an_asset_that_stops_reporting_goes_offline_and_comes_back_on_the_next_reading() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (_, feed_token) = feed_credential(&app, &token, document_id, 1).await;
+
+    let mut viewer = open(&app, document_id, &token, None).await;
+    expect_join(&mut viewer).await;
+    let mut producer = open_ingest(&app, &feed_token).await;
+    ingest_and_settle(&mut producer, vec![reading("TWIN-03", "temperature", 21.5)]).await;
+    viewer.expect_message("readings").await;
+    assert_eq!(viewer.expect_message("liveness").await["online"], true);
+
+    // an interval of one second and three missed reports, so four seconds on
+    // means it has gone quiet. the clock is handed in rather than waited out.
+    let quiet_at = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
+    agora_server::assets::mark_stale(&app.state.rooms, quiet_at).await;
+
+    let gone = viewer.expect_message("liveness").await;
+    assert_eq!(gone["asset"], "TWIN-03");
+    assert_eq!(gone["online"], false);
+    assert!(
+        time::OffsetDateTime::parse(
+            gone["at"].as_str().expect("a time"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok()
+    );
+
+    agora_server::assets::mark_stale(&app.state.rooms, quiet_at).await;
+    assert!(
+        viewer.try_next_message().await.is_none(),
+        "an asset already offline was marked offline again"
+    );
+
+    // the route agrees with the frame the room sent
+    let body = assets_of(&app, &token, document_id).await;
+    assert_eq!(only_asset(&body)["online"], true, "it is not stale yet");
+
+    ingest_and_settle(&mut producer, vec![reading("TWIN-03", "temperature", 22.0)]).await;
+    viewer.expect_message("readings").await;
+    let back = viewer.expect_message("liveness").await;
+    assert_eq!(back["asset"], "TWIN-03");
+    assert_eq!(back["online"], true);
+}
+
+#[tokio::test]
+async fn a_room_that_loads_after_an_asset_went_quiet_starts_it_offline() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (feed_id, _) = feed_credential(&app, &token, document_id, 1).await;
+    age_readings(&app, feed_id, "TWIN-03", 1).await;
+
+    let mut client = open(&app, document_id, &token, None).await;
+    client.expect_message("snapshot").await;
+    let assets = client.expect_message("assets").await;
+    assert_eq!(only_asset(&assets)["online"], false);
+    client.expect_message("peers").await;
+
+    // and the stale pass has nothing left to say about it
+    agora_server::assets::mark_stale(&app.state.rooms, time::OffsetDateTime::now_utc()).await;
+    assert!(client.try_next_message().await.is_none());
+}
+
+#[tokio::test]
+async fn the_sweep_deletes_readings_past_the_retention_window() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (feed_id, _) = feed_credential(&app, &token, document_id, 5).await;
+
+    age_readings(&app, feed_id, "old", READINGS_RETENTION_DAYS + 1).await;
+    age_readings(&app, feed_id, "recent", READINGS_RETENTION_DAYS - 1).await;
+    assert_eq!(stored_assets(&app, feed_id).await, vec!["old", "recent"]);
+
+    agora_server::assets::sweep(&app.state.pool)
+        .await
+        .expect("sweep readings");
+    assert_eq!(stored_assets(&app, feed_id).await, vec!["recent"]);
 }

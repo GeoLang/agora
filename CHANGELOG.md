@@ -4,6 +4,21 @@
 
 ### Added
 
+- 2026-08-25: **sensor feeds and asset liveness**. A document can register feeds
+  (`POST /documents/{id}/feeds`, migration 008), each getting a token that
+  reaches one new socket, `GET /feeds/ws`, and nothing else: every existing route
+  and `/ws` now refuse a token carrying `agora_use`, and the socket also checks
+  the feed row still exists on the document the token names, which is what
+  deleting the feed revokes. A `readings` frame is stored in one insert, answered
+  with `{"type": "ack", "count": N}` and fanned out to everyone on the document.
+  `GET /documents/{id}/assets` answers the latest value per asset and kind with
+  whether it is still reporting, and `?t=` on `/assets/at` answers the same as of
+  a past moment. An asset that misses three of its feed's intervals gets a
+  `liveness` frame, checked once a second over the documents somebody has open,
+  and the next reading brings it back. A join now carries an `assets` frame
+  between the snapshot and `peers`. Readings are kept 30 days. New `assets` op
+  namespace for how a client draws them.
+
 - 2026-08-23: **`GET /documents` lists what a project role reaches**. A caller
   who has no members row on a document but holds a role on the project it is
   linked to now finds it in their listing, at the wider of the two roles and
