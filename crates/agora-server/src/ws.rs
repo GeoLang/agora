@@ -8,10 +8,12 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use sqlx::PgPool;
+use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::assets::asset_states;
 use crate::auth::{AGORA_WRITE_SCOPE, BEARER_SUBPROTOCOL, VerificationError, websocket_token};
 use crate::documents::{effective_role, project_grant};
 use crate::error::ApiError;
@@ -204,8 +206,26 @@ async fn close_with(mut socket: WebSocket, reason: &str) {
 }
 
 /// What a client is sent before the live stream starts: either the whole state
-/// or the ops it missed, when the retained tail still reaches back that far.
+/// or the ops it missed, when the retained tail still reaches back that far,
+/// and then what every asset on the document is reporting.
+///
+/// The asset frame goes out on every join, a resume that missed nothing
+/// included, because asset state is not carried by ops and so cannot be
+/// replayed from the tail.
 async fn opening_messages(
+    pool: &PgPool,
+    document_id: Uuid,
+    since: Option<i64>,
+    seq: i64,
+    state: serde_json::Value,
+    identity: &Identity,
+) -> Vec<ServerMessage> {
+    let mut opening = document_messages(pool, document_id, since, seq, state, identity).await;
+    opening.push(assets_message(pool, document_id).await);
+    opening
+}
+
+async fn document_messages(
     pool: &PgPool,
     document_id: Uuid,
     since: Option<i64>,
@@ -232,6 +252,16 @@ async fn opening_messages(
         }
         _ => snapshot(),
     }
+}
+
+/// A database failure here sends an empty asset list rather than dropping the
+/// frame, so the join sequence a client waits on is always the same length.
+/// The next reading or liveness frame corrects it.
+async fn assets_message(pool: &PgPool, document_id: Uuid) -> ServerMessage {
+    let assets = asset_states(pool, document_id, None, OffsetDateTime::now_utc())
+        .await
+        .unwrap_or_default();
+    ServerMessage::Assets { assets }
 }
 
 fn snapshot_message(seq: i64, state: serde_json::Value, identity: &Identity) -> ServerMessage {

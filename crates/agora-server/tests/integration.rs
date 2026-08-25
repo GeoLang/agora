@@ -6,8 +6,9 @@ use std::time::Duration;
 use agora_server::auth::{AuthConfig, capability_token_hash};
 use agora_server::limits::{
     ATTACHMENT_GRACE_DAYS, MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND,
-    MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES,
-    MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT, MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
+    MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_FEED_READINGS_PER_FRAME,
+    MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT,
+    MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES,
 };
 use agora_server::projects::ProjectAccess;
 use agora_server::protocol::{BatchOp, OpValue, Peer};
@@ -339,8 +340,14 @@ impl WebsocketClient {
     }
 
     async fn send(&mut self, message: Value) {
+        self.send_text(&message.to_string()).await;
+    }
+
+    /// Raw text, for a frame `serde_json::Value` cannot hold, such as one
+    /// carrying a number outside f64.
+    async fn send_text(&mut self, text: &str) {
         self.stream
-            .send(Message::text(message.to_string()))
+            .send(Message::text(text.to_string()))
             .await
             .expect("send");
     }
@@ -462,9 +469,10 @@ async fn expect_op_with_seq(client: &mut WebsocketClient, seq: i64) -> Value {
     panic!("op {seq} never arrived")
 }
 
-/// The whole join sequence: a snapshot, then the peer list.
+/// The whole join sequence: a snapshot, the assets, then the peer list.
 async fn expect_join(client: &mut WebsocketClient) -> (Value, Value) {
     let snapshot = client.expect_message("snapshot").await;
+    client.expect_message("assets").await;
     let peers = client.expect_message("peers").await;
     (snapshot, peers)
 }
@@ -515,7 +523,7 @@ async fn apply_ops_directly_from(
 }
 
 #[tokio::test]
-async fn a_join_receives_a_snapshot_then_the_peer_list() {
+async fn a_join_receives_a_snapshot_the_assets_then_the_peer_list() {
     let app = spawn_app().await;
     let owner = fresh_user();
     let token = platform_token(&owner);
@@ -525,12 +533,19 @@ async fn a_join_receives_a_snapshot_then_the_peer_list() {
     let snapshot = client.expect_message("snapshot").await;
     assert_eq!(snapshot["seq"], 0);
     assert_eq!(snapshot["state"]["meta"]["name"], "city plan");
-    for namespace in ["layers", "annotations", "bookmarks", "comments"] {
+    for namespace in ["layers", "annotations", "bookmarks", "comments", "assets"] {
         assert!(snapshot["state"][namespace].is_object(), "{namespace}");
     }
     // a client learns who it is and what it may do from the snapshot itself
     assert_eq!(snapshot["actor"], owner.as_str());
     assert_eq!(snapshot["role"], "edit");
+
+    let assets = client.expect_message("assets").await;
+    assert_eq!(
+        assets["assets"].as_array().expect("an asset array").len(),
+        0,
+        "a document with no feeds reported assets"
+    );
 
     let peers = client.expect_message("peers").await;
     let peers = peers["peers"].as_array().expect("a peer array");
@@ -819,6 +834,7 @@ async fn a_view_role_op_is_refused_and_the_connection_stays_open() {
     let mut reader_client = open(&app, document_id, &reader_token, None).await;
     let snapshot = reader_client.expect_message("snapshot").await;
     assert_eq!(snapshot["role"], "view", "a reader was not told its role");
+    reader_client.expect_message("assets").await;
     reader_client.expect_message("peers").await;
 
     let reason = send_and_refuse(
@@ -933,6 +949,7 @@ async fn a_reconnect_with_since_replays_only_the_missed_ops() {
     assert_eq!(first["key"], "layers/l2");
     let second = reconnected.expect_message("op").await;
     assert_eq!(second["seq"], 3);
+    reconnected.expect_message("assets").await;
     reconnected.expect_message("peers").await;
     assert!(
         reconnected.try_next_message().await.is_none(),
@@ -940,6 +957,7 @@ async fn a_reconnect_with_since_replays_only_the_missed_ops() {
     );
 
     let mut caught_up = open(&app, document_id, &token, Some(3)).await;
+    caught_up.expect_message("assets").await;
     let peers = caught_up.expect_message("peers").await;
     assert!(peers["peers"].is_array(), "a caught up client got a replay");
 }
@@ -994,6 +1012,7 @@ async fn a_reconnect_replays_a_batch_as_the_one_frame_it_was_applied_in() {
     let last = reconnected.expect_message("op").await;
     assert_eq!(last["seq"], 4);
     assert_eq!(last["key"], "layers/last");
+    reconnected.expect_message("assets").await;
     reconnected.expect_message("peers").await;
     assert!(
         reconnected.try_next_message().await.is_none(),
@@ -1033,6 +1052,7 @@ async fn a_since_older_than_the_retained_tail_falls_back_to_a_snapshot() {
     let snapshot = reconnected.expect_message("snapshot").await;
     assert_eq!(snapshot["seq"], 3);
     assert_eq!(snapshot["state"]["layers"]["l1"]["order"], "a0");
+    reconnected.expect_message("assets").await;
     reconnected.expect_message("peers").await;
 }
 
@@ -1413,8 +1433,7 @@ async fn the_document_state_cap_refuses_an_op_that_would_exceed_it() {
     assert!(accepted >= 60, "the state cap refused far too early");
 
     let mut client = open(&app, document_id, &token, None).await;
-    client.expect_message("snapshot").await;
-    client.expect_message("peers").await;
+    expect_join(&mut client).await;
     let reason = send_and_refuse(&mut client, 1, "layers/one-more", json!(chunk)).await;
     assert_eq!(reason, "document state limit reached");
 
@@ -4345,4 +4364,474 @@ async fn a_feed_token_is_refused_everywhere_a_caller_is_expected() {
         Some(401),
         "a feed token opened the document socket"
     );
+}
+
+/// The ingest handshake, with the feed token in the subprotocol offer.
+async fn connect_ingest(
+    app: &TestApp,
+    token: &str,
+) -> Result<(WebsocketClient, Response), WebsocketError> {
+    let mut request = format!("{}/feeds/ws", app.websocket_base).into_client_request()?;
+    let offer = HeaderValue::from_str(&format!("bearer, {token}")).expect("header value");
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", offer);
+    let (stream, response) = connect_async(request).await?;
+    Ok((WebsocketClient { stream }, response))
+}
+
+async fn open_ingest(app: &TestApp, token: &str) -> WebsocketClient {
+    connect_ingest(app, token).await.expect("handshake").0
+}
+
+fn readings_frame(readings: Vec<Value>) -> Value {
+    json!({"type": "readings", "readings": readings})
+}
+
+fn reading(asset: &str, kind: &str, value: f64) -> Value {
+    json!({"asset": asset, "kind": kind, "value": value})
+}
+
+fn reading_at(asset: &str, kind: &str, value: f64, at: &str) -> Value {
+    json!({"asset": asset, "kind": kind, "value": value, "at": at})
+}
+
+/// Push one frame and settle it, so the readings are stored before the caller
+/// reads them back.
+async fn ingest_and_settle(producer: &mut WebsocketClient, readings: Vec<Value>) -> usize {
+    let count = readings.len();
+    producer.send(readings_frame(readings)).await;
+    let ack = producer.expect_message("ack").await;
+    assert_eq!(ack["count"], count);
+    count
+}
+
+async fn assets_of(app: &TestApp, token: &str, document_id: Uuid) -> Value {
+    let response = app
+        .client
+        .get(format!("{}/documents/{document_id}/assets", app.http_base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list assets");
+    assert_eq!(response.status(), 200);
+    response.json().await.expect("json body")
+}
+
+async fn assets_at(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    query: &str,
+) -> reqwest::Response {
+    app.client
+        .get(format!(
+            "{}/documents/{document_id}/assets/at?{query}",
+            app.http_base
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list assets at")
+}
+
+/// The one asset in a document that has exactly one.
+fn only_asset(body: &Value) -> &Value {
+    let assets = body["assets"].as_array().expect("an asset array");
+    assert_eq!(assets.len(), 1, "{body}");
+    &assets[0]
+}
+
+fn value_of(asset: &Value, kind: &str) -> Value {
+    asset["values"]
+        .as_array()
+        .expect("a value array")
+        .iter()
+        .find(|value| value["kind"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} in {asset}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn readings_reach_everyone_on_the_document_and_the_assets_route() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (feed_id, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+
+    let mut viewer = open(&app, document_id, &token, None).await;
+    expect_join(&mut viewer).await;
+
+    let mut producer = open_ingest(&app, &feed_token).await;
+    ingest_and_settle(
+        &mut producer,
+        vec![
+            reading("TWIN-03", "temperature", 21.5),
+            reading("TWIN-03", "humidity", 0.4),
+        ],
+    )
+    .await;
+
+    let relayed = viewer.expect_message("readings").await;
+    assert_eq!(relayed["feed"], feed_id.to_string());
+    let relayed = relayed["readings"].as_array().expect("readings").clone();
+    assert_eq!(relayed.len(), 2);
+    assert_eq!(relayed[0]["asset"], "TWIN-03");
+    assert_eq!(relayed[0]["kind"], "temperature");
+    assert_eq!(relayed[0]["value"], 21.5);
+    assert!(
+        time::OffsetDateTime::parse(
+            relayed[0]["at"].as_str().expect("a reading time"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok(),
+        "a relayed reading time is not rfc 3339"
+    );
+
+    // an asset nobody had heard from is reporting now
+    let liveness = viewer.expect_message("liveness").await;
+    assert_eq!(liveness["asset"], "TWIN-03");
+    assert_eq!(liveness["online"], true);
+
+    let body = assets_of(&app, &token, document_id).await;
+    let asset = only_asset(&body);
+    assert_eq!(asset["asset"], "TWIN-03");
+    assert_eq!(asset["feed"], feed_id.to_string());
+    assert_eq!(asset["online"], true);
+    assert_eq!(value_of(asset, "temperature")["value"], 21.5);
+    assert_eq!(value_of(asset, "humidity")["value"], 0.4);
+}
+
+#[tokio::test]
+async fn the_latest_reading_wins_and_the_history_route_answers_an_earlier_one() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (_, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+    let mut producer = open_ingest(&app, &feed_token).await;
+
+    ingest_and_settle(
+        &mut producer,
+        vec![reading_at(
+            "TWIN-03",
+            "temperature",
+            21.5,
+            "2026-08-25T12:00:00Z",
+        )],
+    )
+    .await;
+    ingest_and_settle(
+        &mut producer,
+        vec![reading_at(
+            "TWIN-03",
+            "temperature",
+            25.0,
+            "2026-08-25T12:00:10Z",
+        )],
+    )
+    .await;
+
+    let body = assets_of(&app, &token, document_id).await;
+    assert_eq!(value_of(only_asset(&body), "temperature")["value"], 25.0);
+
+    let earlier: Value = assets_at(&app, &token, document_id, "t=2026-08-25T12:00:05Z")
+        .await
+        .json()
+        .await
+        .expect("json body");
+    let asset = only_asset(&earlier);
+    assert_eq!(value_of(asset, "temperature")["value"], 21.5);
+    assert_eq!(value_of(asset, "temperature")["at"], "2026-08-25T12:00:00Z");
+    assert_eq!(asset["online"], true, "online is judged against t");
+
+    // before anything was reported the document has no assets at all
+    let before: Value = assets_at(&app, &token, document_id, "t=2026-08-25T11:59:59Z")
+        .await
+        .json()
+        .await
+        .expect("json body");
+    assert!(before["assets"].as_array().expect("an array").is_empty());
+
+    // and far enough after the last reading the asset has gone quiet
+    let later: Value = assets_at(&app, &token, document_id, "t=2026-08-25T12:01:00Z")
+        .await
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(only_asset(&later)["online"], false);
+
+    for query in ["", "t=", "t=yesterday", "t=1756123200"] {
+        assert_eq!(
+            assets_at(&app, &token, document_id, query).await.status(),
+            400,
+            "{query:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_reading_is_stored_once() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (feed_id, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+    let mut producer = open_ingest(&app, &feed_token).await;
+
+    let frame = vec![reading_at(
+        "TWIN-03",
+        "temperature",
+        21.5,
+        "2026-08-25T12:00:00Z",
+    )];
+    ingest_and_settle(&mut producer, frame.clone()).await;
+    ingest_and_settle(&mut producer, frame).await;
+
+    let stored: i64 = sqlx::query_scalar("select count(*) from readings where feed_id = $1")
+        .bind(feed_id)
+        .fetch_one(&app.state.pool)
+        .await
+        .expect("count readings");
+    assert_eq!(stored, 1);
+}
+
+#[tokio::test]
+async fn the_assets_routes_need_a_role_on_the_document() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let stranger_token = platform_token(&fresh_user());
+
+    assert_eq!(
+        app.client
+            .get(format!("{}/documents/{document_id}/assets", app.http_base))
+            .bearer_auth(&stranger_token)
+            .send()
+            .await
+            .expect("list assets")
+            .status(),
+        404
+    );
+    assert_eq!(
+        assets_at(&app, &stranger_token, document_id, "t=2026-08-25T12:00:00Z")
+            .await
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_bad_ingest_frame_closes_the_socket() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (_, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+
+    let over_long_asset = readings_frame(vec![reading(&"a".repeat(129), "temperature", 1.0)]);
+    for (frame, expected) in [
+        ("not json".to_string(), "malformed message"),
+        (json!({"type": "nonsense"}).to_string(), "malformed message"),
+        (json!("not even an object").to_string(), "malformed message"),
+        (
+            readings_frame(vec![]).to_string(),
+            "frame carries no readings",
+        ),
+        // a value past f64 never reaches the finite check, since serde_json
+        // refuses the number itself
+        (
+            r#"{"type":"readings","readings":[{"asset":"TWIN-03","kind":"temperature","value":1e400}]}"#
+                .to_string(),
+            "malformed message",
+        ),
+        (over_long_asset.to_string(), "invalid asset id"),
+        (
+            readings_frame(vec![reading("TWIN 03", "temperature", 1.0)]).to_string(),
+            "invalid asset id",
+        ),
+        (
+            readings_frame(vec![reading("TWIN-03", "", 1.0)]).to_string(),
+            "invalid reading kind",
+        ),
+        (
+            readings_frame(vec![reading_at("TWIN-03", "temperature", 1.0, "yesterday")]).to_string(),
+            "invalid reading time",
+        ),
+    ] {
+        let mut producer = open_ingest(&app, &feed_token).await;
+        producer.send_text(&frame).await;
+        let refusal = producer.expect_message("error").await;
+        assert_eq!(refusal["reason"], expected, "{frame}");
+        assert!(producer.is_closed().await, "{frame} left the socket open");
+    }
+
+    // nothing from any of those frames was stored
+    let body = assets_of(&app, &token, document_id).await;
+    assert!(body["assets"].as_array().expect("an array").is_empty());
+}
+
+#[tokio::test]
+async fn an_ingest_frame_past_the_reading_cap_closes_the_socket() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (_, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+
+    let over_cap = (0..MAX_FEED_READINGS_PER_FRAME + 1)
+        .map(|index| reading(&format!("TWIN-{index}"), "temperature", 1.0))
+        .collect();
+    let mut producer = open_ingest(&app, &feed_token).await;
+    producer.send(readings_frame(over_cap)).await;
+    let refusal = producer.expect_message("error").await;
+    assert_eq!(refusal["reason"], "too many readings");
+    assert!(producer.is_closed().await);
+
+    // the rate limiter charges a frame per reading, so the budget runs out
+    // before the frame cap does
+    let at_cap: Vec<Value> = (0..MAX_FEED_READINGS_PER_FRAME)
+        .map(|index| reading(&format!("TWIN-{index}"), "temperature", 1.0))
+        .collect();
+    let mut producer = open_ingest(&app, &feed_token).await;
+    producer.send(readings_frame(at_cap)).await;
+    let refusal = producer.expect_message("error").await;
+    assert_eq!(refusal["reason"], "rate limit exceeded");
+    assert!(producer.is_closed().await);
+}
+
+#[tokio::test]
+async fn only_a_feed_token_opens_the_ingest_socket() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let session_token = guest_session(&app, &token, document_id, "edit").await;
+    let tool = tool_token(&fresh_user(), &["agora:read", "agora:write"]);
+
+    for refused in [
+        token.clone(),
+        session_token,
+        tool,
+        "not.a.token".to_string(),
+    ] {
+        assert_eq!(
+            handshake_status(connect_ingest(&app, &refused).await),
+            Some(401),
+            "a token that is not a feed token opened the ingest socket"
+        );
+    }
+    assert_eq!(
+        handshake_status(
+            connect_async(format!("{}/feeds/ws", app.websocket_base))
+                .await
+                .map(|(stream, response)| (WebsocketClient { stream }, response))
+        ),
+        Some(401),
+        "the ingest socket opened with no token at all"
+    );
+}
+
+#[tokio::test]
+async fn a_feed_token_reaches_only_its_own_live_feed() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let other_document_id = create_document(&app, &token, "somewhere else").await;
+    let (feed_id, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+
+    // the same feed, claiming to report to a document it is not on
+    let forged = encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": feed_id,
+            "exp": time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "doc": other_document_id,
+            "agora_use": "feed"
+        }),
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .expect("sign a forged feed token");
+    assert_eq!(
+        handshake_status(connect_ingest(&app, &forged).await),
+        Some(401)
+    );
+
+    // a feed that never existed
+    let unknown = encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": Uuid::new_v4(),
+            "exp": time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "doc": document_id,
+            "agora_use": "feed"
+        }),
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .expect("sign an unknown feed token");
+    assert_eq!(
+        handshake_status(connect_ingest(&app, &unknown).await),
+        Some(401)
+    );
+
+    // the real one works until the feed is deleted
+    open_ingest(&app, &feed_token).await.close().await;
+    assert_eq!(
+        delete_feed(&app, &token, document_id, feed_id)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        handshake_status(connect_ingest(&app, &feed_token).await),
+        Some(401)
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_feed_closes_a_socket_still_holding_its_token() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (feed_id, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+
+    let mut producer = open_ingest(&app, &feed_token).await;
+    ingest_and_settle(&mut producer, vec![reading("TWIN-03", "temperature", 21.5)]).await;
+
+    assert_eq!(
+        delete_feed(&app, &token, document_id, feed_id)
+            .await
+            .status(),
+        204
+    );
+    producer
+        .send(readings_frame(vec![reading(
+            "TWIN-03",
+            "temperature",
+            22.0,
+        )]))
+        .await;
+    let refusal = producer.expect_message("error").await;
+    assert_eq!(refusal["reason"], "feed revoked");
+    assert!(producer.is_closed().await);
+
+    // the readings went with the feed
+    let body = assets_of(&app, &token, document_id).await;
+    assert!(body["assets"].as_array().expect("an array").is_empty());
+}
+
+#[tokio::test]
+async fn a_join_after_readings_gets_the_assets_before_the_peers() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let (feed_id, feed_token) = feed_credential(&app, &token, document_id, 5).await;
+
+    let mut producer = open_ingest(&app, &feed_token).await;
+    ingest_and_settle(&mut producer, vec![reading("TWIN-03", "temperature", 21.5)]).await;
+
+    let mut client = open(&app, document_id, &token, None).await;
+    client.expect_message("snapshot").await;
+    let assets = client.expect_message("assets").await;
+    let asset = only_asset(&assets);
+    assert_eq!(asset["asset"], "TWIN-03");
+    assert_eq!(asset["feed"], feed_id.to_string());
+    assert_eq!(asset["online"], true);
+    assert_eq!(value_of(asset, "temperature")["value"], 21.5);
+    client.expect_message("peers").await;
 }

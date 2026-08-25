@@ -4,9 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use sqlx::{PgPool, Row};
+use time::OffsetDateTime;
 use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
+use crate::assets::{AssetTracker, load_tracker};
 use crate::limits::{
     CHECKPOINT_INTERVAL_OPS, MAX_DOCUMENT_STATE_BYTES, MAX_PEERS_PER_DOCUMENT,
     ROOM_BROADCAST_CAPACITY, oldest_op_to_keep,
@@ -114,6 +116,7 @@ pub struct Room {
     pub document_id: Uuid,
     sender: broadcast::Sender<RoomEvent>,
     inner: Mutex<RoomInner>,
+    assets: Mutex<AssetTracker>,
 }
 
 impl Room {
@@ -122,6 +125,9 @@ impl Room {
             .await
             .map_err(JoinError::Database)?
             .ok_or(JoinError::DocumentNotFound)?;
+        let assets = load_tracker(pool, document_id, OffsetDateTime::now_utc())
+            .await
+            .map_err(JoinError::Database)?;
 
         let (sender, _) = broadcast::channel(ROOM_BROADCAST_CAPACITY);
         Ok(Self {
@@ -133,7 +139,33 @@ impl Room {
                 checkpoint_seq,
                 peers: Vec::new(),
             }),
+            assets: Mutex::new(assets),
         })
+    }
+
+    /// Note what a feed just reported, and hand back the assets that were not
+    /// reporting until now with the reading time that brought each back.
+    pub async fn record_readings(
+        &self,
+        feed_id: Uuid,
+        interval_seconds: i32,
+        reported: &[(&str, OffsetDateTime)],
+        now: OffsetDateTime,
+    ) -> Vec<(String, OffsetDateTime)> {
+        let mut assets = self.assets.lock().await;
+        let mut came_online = Vec::new();
+        for (asset, at) in reported {
+            if assets.record(asset, feed_id, interval_seconds, *at, now) {
+                came_online.push(((*asset).to_string(), *at));
+            }
+        }
+        came_online
+    }
+
+    /// Mark the assets that have missed too many reports offline and hand back
+    /// the ones that just flipped.
+    pub async fn mark_assets_offline(&self, now: OffsetDateTime) -> Vec<String> {
+        self.assets.lock().await.go_offline(now)
     }
 
     pub async fn snapshot(&self) -> (i64, Value) {
@@ -442,6 +474,18 @@ impl RoomRegistry {
 
     pub async fn is_loaded(&self, document_id: Uuid) -> bool {
         self.rooms.lock().await.contains_key(&document_id)
+    }
+
+    /// The room for a document while one is loaded, which is what an ingested
+    /// reading is fanned out through. A document nobody is looking at has none.
+    pub async fn loaded(&self, document_id: Uuid) -> Option<Arc<Room>> {
+        self.rooms.lock().await.get(&document_id).map(Arc::clone)
+    }
+
+    /// Every loaded room, so the stale sweep can walk them without holding the
+    /// registry lock while it works.
+    pub async fn loaded_rooms(&self) -> Vec<Arc<Room>> {
+        self.rooms.lock().await.values().map(Arc::clone).collect()
     }
 }
 

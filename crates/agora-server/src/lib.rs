@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod assets;
 pub mod attachments;
 pub mod auth;
 pub mod documents;
@@ -102,6 +103,9 @@ pub fn router(state: AppState) -> Router {
             "/documents/{id}/feeds/{feed_id}",
             delete(feeds::delete_feed),
         )
+        .route("/documents/{id}/assets", get(assets::list_assets))
+        .route("/documents/{id}/assets/at", get(assets::list_assets_at))
+        .route("/feeds/ws", get(feeds::ingest))
         .route(
             "/documents/{id}/attachments",
             post(attachments::create_attachment),

@@ -2,8 +2,20 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::role::DocumentRole;
+
+/// What goes out when a frame cannot be serialized, so a client can never turn
+/// an encoding failure into a panic.
+const ENCODE_FAILURE: &str = r#"{"type":"error","reason":"could not encode message"}"#;
+
+fn encode_frame(message: &impl Serialize) -> Arc<str> {
+    match serde_json::to_string(message) {
+        Ok(text) => Arc::from(text),
+        Err(_) => Arc::from(ENCODE_FAILURE),
+    }
+}
 
 /// The `value` on an op: required on the wire, and `null` deletes the key.
 ///
@@ -61,6 +73,72 @@ pub enum ClientMessage {
     },
 }
 
+/// A message a sensor feed may send on the ingest socket.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FeedMessage {
+    Readings { readings: Vec<FeedReading> },
+}
+
+/// One reading as a feed sends it. `at` is optional and defaults to the time
+/// the server took the frame, which is what a device with no clock relies on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedReading {
+    pub asset: String,
+    pub kind: String,
+    pub value: f64,
+    #[serde(default)]
+    pub at: Option<String>,
+}
+
+/// What the ingest socket answers with. Its `ack` counts readings, so it is not
+/// the document socket's `ack`, and the two sockets share no message type.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FeedReply {
+    Ack { count: usize },
+    Error { reason: String },
+}
+
+impl FeedReply {
+    pub fn error(reason: impl Into<String>) -> Self {
+        FeedReply::Error {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn encode(&self) -> Arc<str> {
+        encode_frame(self)
+    }
+}
+
+/// One reading as it is relayed to everyone on the document, `at` in RFC 3339.
+#[derive(Debug, Clone, Serialize)]
+pub struct Reading {
+    pub asset: String,
+    pub kind: String,
+    pub value: f64,
+    pub at: String,
+}
+
+/// The latest reading of one kind for an asset.
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetValue {
+    pub kind: String,
+    pub value: f64,
+    pub at: String,
+}
+
+/// One asset as of some moment: which feed reports it, whether it is still
+/// reporting, and its latest value of every kind.
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetState {
+    pub asset: String,
+    pub feed: Uuid,
+    pub online: bool,
+    pub values: Vec<AssetValue>,
+}
+
 /// One op the server has ordered, as it appears inside a relayed batch. Each
 /// carries its own seq, and a reconnect replays the batch as the same frame.
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +190,22 @@ pub enum ServerMessage {
         selection: Vec<String>,
         viewport: Option<Value>,
     },
+    /// What a feed just reported, on its way to everyone looking at the
+    /// document.
+    Readings {
+        feed: Uuid,
+        readings: Vec<Reading>,
+    },
+    /// Every asset the document's feeds report, sent on join.
+    Assets {
+        assets: Vec<AssetState>,
+    },
+    /// An asset started or stopped reporting.
+    Liveness {
+        asset: String,
+        online: bool,
+        at: String,
+    },
     Error {
         reason: String,
     },
@@ -124,14 +218,9 @@ impl ServerMessage {
         }
     }
 
-    /// Encode once so the room can hand the same bytes to every peer. There is
-    /// no unwrap here, so a client can never turn an encoding failure into a
-    /// panic.
+    /// Encode once so the room can hand the same bytes to every peer.
     pub fn encode(&self) -> Arc<str> {
-        match serde_json::to_string(self) {
-            Ok(text) => Arc::from(text),
-            Err(_) => Arc::from(r#"{"type":"error","reason":"could not encode message"}"#),
-        }
+        encode_frame(self)
     }
 }
 
@@ -375,5 +464,122 @@ mod tests {
             serde_json::from_str::<Value>(&ServerMessage::error("nope").encode()).unwrap(),
             json!({"type": "error", "reason": "nope"})
         );
+    }
+
+    #[test]
+    fn the_twin_frames_match_the_pinned_wire_shape() {
+        let feed = Uuid::new_v4();
+        let readings = ServerMessage::Readings {
+            feed,
+            readings: vec![Reading {
+                asset: "TWIN-03".to_string(),
+                kind: "temperature".to_string(),
+                value: 21.5,
+                at: "2026-08-25T12:00:00Z".to_string(),
+            }],
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&readings.encode()).unwrap(),
+            json!({
+                "type": "readings",
+                "feed": feed,
+                "readings": [{
+                    "asset": "TWIN-03",
+                    "kind": "temperature",
+                    "value": 21.5,
+                    "at": "2026-08-25T12:00:00Z"
+                }]
+            })
+        );
+
+        let assets = ServerMessage::Assets {
+            assets: vec![AssetState {
+                asset: "TWIN-03".to_string(),
+                feed,
+                online: true,
+                values: vec![AssetValue {
+                    kind: "temperature".to_string(),
+                    value: 21.5,
+                    at: "2026-08-25T12:00:00Z".to_string(),
+                }],
+            }],
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&assets.encode()).unwrap(),
+            json!({
+                "type": "assets",
+                "assets": [{
+                    "asset": "TWIN-03",
+                    "feed": feed,
+                    "online": true,
+                    "values": [{
+                        "kind": "temperature",
+                        "value": 21.5,
+                        "at": "2026-08-25T12:00:00Z"
+                    }]
+                }]
+            })
+        );
+
+        let liveness = ServerMessage::Liveness {
+            asset: "TWIN-03".to_string(),
+            online: false,
+            at: "2026-08-25T12:00:09Z".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&liveness.encode()).unwrap(),
+            json!({
+                "type": "liveness",
+                "asset": "TWIN-03",
+                "online": false,
+                "at": "2026-08-25T12:00:09Z"
+            })
+        );
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&FeedReply::Ack { count: 2 }.encode()).unwrap(),
+            json!({"type": "ack", "count": 2})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&FeedReply::error("malformed message").encode()).unwrap(),
+            json!({"type": "error", "reason": "malformed message"})
+        );
+    }
+
+    #[test]
+    fn an_ingest_frame_parses_with_and_without_a_reading_time() {
+        let parsed: FeedMessage = serde_json::from_str(
+            r#"{"type":"readings","readings":[
+                {"asset":"TWIN-03","kind":"temperature","value":21.5,"at":"2026-08-25T12:00:00Z"},
+                {"asset":"TWIN-04","kind":"humidity","value":0.4}
+            ]}"#,
+        )
+        .unwrap();
+        let FeedMessage::Readings { readings } = parsed;
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0].asset, "TWIN-03");
+        assert_eq!(readings[0].at.as_deref(), Some("2026-08-25T12:00:00Z"));
+        assert_eq!(readings[1].value, 0.4);
+        assert_eq!(readings[1].at, None);
+    }
+
+    #[test]
+    fn an_ingest_frame_missing_a_field_or_naming_another_type_is_refused() {
+        for text in [
+            r#"{"type":"readings"}"#,
+            r#"{"type":"readings","readings":{}}"#,
+            r#"{"type":"readings","readings":[{"kind":"temperature","value":1}]}"#,
+            r#"{"type":"readings","readings":[{"asset":"a","value":1}]}"#,
+            r#"{"type":"readings","readings":[{"asset":"a","kind":"b"}]}"#,
+            r#"{"type":"readings","readings":[{"asset":"a","kind":"b","value":"warm"}]}"#,
+            r#"{"type":"op","clientSeq":1,"key":"layers/a","value":null}"#,
+            r#"{"type":"presence"}"#,
+            "not json",
+        ] {
+            assert!(
+                serde_json::from_str::<FeedMessage>(text).is_err(),
+                "{text:?}"
+            );
+        }
     }
 }
