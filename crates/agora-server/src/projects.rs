@@ -371,7 +371,10 @@ fn project_entry(entry: &serde_json::Value) -> Option<(Uuid, ProjectRole)> {
 
 /// The body, or `None` once it passes `cap`. Read chunk by chunk so a wrong url
 /// streaming without end cannot be buffered whole.
-async fn read_capped_body(mut response: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
+pub(crate) async fn read_capped_body(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.ok()? {
         if body.len() + chunk.len() > cap {

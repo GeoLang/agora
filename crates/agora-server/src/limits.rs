@@ -92,6 +92,38 @@ pub const STALE_MISSED_INTERVALS: i64 = 3;
 /// How often the loaded rooms are walked for assets that have gone quiet.
 pub const STALE_CHECK_INTERVAL_SECONDS: u64 = 1;
 
+/// Shortest reporting interval a region watch may declare, seconds. A watch
+/// costs one geoplumb reduction per run, which is far more work than a sensor
+/// reading, so it is floored well above a feed's.
+pub const MIN_WATCH_INTERVAL_SECONDS: i32 = 60;
+
+/// Ring positions across a watch region, summed over every ring. geoplumb
+/// refuses a reduction past 20000, so a region accepted here always fits.
+pub const MAX_REGION_POSITIONS: usize = 4_000;
+
+/// Positions the smallest closed ring carries.
+pub const MIN_RING_POSITIONS: usize = 4;
+
+/// Bytes of a watch region's json encoding. The position cap does not bound a
+/// position carrying a thousand numbers, nor the keys a geojson object may
+/// carry beside the ones read here.
+pub const MAX_REGION_BYTES: usize = 256 * 1024;
+
+/// Longest accepted layer name, bytes. A layer name is whatever geoplumb's
+/// config called it, and agora has no layer directory of its own.
+pub const MAX_LAYER_NAME_BYTES: usize = 128;
+
+/// Longest accepted webhook url and shared secret, bytes.
+pub const MAX_WEBHOOK_URL_BYTES: usize = 2048;
+pub const MAX_WEBHOOK_SECRET_BYTES: usize = 256;
+
+/// Readings one watch keeps. The retention window drops old ones, and this
+/// drops the ones a short interval piles up inside it.
+pub const MAX_READINGS_PER_WATCH: i64 = 10_000;
+
+/// Watch readings one list call returns.
+pub const MAX_WATCH_READINGS_PAGE: i64 = 500;
+
 /// How long a reading is kept.
 pub const READINGS_RETENTION_DAYS: i64 = 30;
 

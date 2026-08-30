@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -7,49 +9,66 @@ use axum::response::{IntoResponse, Response};
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
-    message: &'static str,
+    message: Cow<'static, str>,
 }
 
 impl ApiError {
     pub fn unauthorized(message: &'static str) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
-            message,
+            message: Cow::Borrowed(message),
         }
     }
 
     pub fn forbidden(message: &'static str) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
-            message,
+            message: Cow::Borrowed(message),
         }
     }
 
     pub fn not_found(message: &'static str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
-            message,
+            message: Cow::Borrowed(message),
         }
     }
 
     pub fn bad_request(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            message,
+            message: Cow::Borrowed(message),
         }
     }
 
     pub fn payload_too_large(message: &'static str) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
-            message,
+            message: Cow::Borrowed(message),
         }
     }
 
     pub fn internal(message: &'static str) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message,
+            message: Cow::Borrowed(message),
+        }
+    }
+
+    pub fn service_unavailable(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: Cow::Borrowed(message),
+        }
+    }
+
+    /// The one refusal that names something the caller sent back to them, so it
+    /// takes an owned message. It travels as a json string and reaches no
+    /// markup, so what it echoes stays data.
+    pub fn unprocessable_entity(message: String) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: Cow::Owned(message),
         }
     }
 }

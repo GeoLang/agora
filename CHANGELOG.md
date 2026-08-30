@@ -4,6 +4,16 @@
 
 ### Added
 
+- 2026-08-30: **region watches, stored and routed**. A document can hold watches
+  over a region (`POST /documents/{id}/watches`, migration 009): a GeoJSON
+  Polygon or MultiPolygon, one geoplumb layer, a reducer, an interval of at
+  least 60 seconds, and optionally a threshold and a webhook. Edit role creates
+  and deletes, any member lists them and reads a watch's history through
+  `GET /documents/{id}/watches/{watchId}/readings`. The webhook url and secret
+  reach a caller who can edit and are absent from everyone else's copy. The
+  layer is checked against `GET {GEOPLUMB_URL}/layers` at create time, so an
+  unknown one is a 422 naming it. `GEOPLUMB_URL` unset turns the feature off.
+
 - 2026-08-30: **an unknown key is refused instead of ignored**. Every request
   body, query string and document socket frame now carries
   `serde(deny_unknown_fields)`, so a key the type does not define is an error

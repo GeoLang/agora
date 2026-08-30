@@ -21,6 +21,7 @@ Migrations run at startup.
 | `DATABASE_URL` | yes | Postgres connection string. Carries the TLS mode, see below. |
 | `PORT` | no | Port to listen on, `3000` by default, which is the internal port the platform's nginx routes `/agora/` to. |
 | `PTOLEMY_URL` | no | Ptolemy's base url, `http://` or `https://`. Turns on project roles, see below. Unset, only agora's own members reach a document, and startup says so. |
+| `GEOPLUMB_URL` | no | Geoplumb's base url, `http://` or `https://`. Turns on region watches, see below. Unset, creating a watch is a 400 and nothing is scheduled. |
 
 Copy `.env.example` and fill it in. Nothing reads a `.env` file at runtime, the
 variables come from the environment.
@@ -129,6 +130,10 @@ anything else.
 | `POST /documents/{id}/feeds` `{"name": "...", "intervalSeconds": 5}` | Registers a sensor feed, edit role only. Returns `{"id", "name", "intervalSeconds", "token"}`, and the token appears here and nowhere else. |
 | `GET /documents/{id}/feeds` | The document's feeds: `{"id", "name", "intervalSeconds", "createdBy", "createdAt"}`. Never the token. |
 | `DELETE /documents/{id}/feeds/{feedId}` | Revokes a feed and deletes its readings, edit role only. |
+| `POST /documents/{id}/watches` | Registers a region watch, edit role only. Returns the watch, webhook included. |
+| `GET /documents/{id}/watches` | The document's watches. The webhook url and secret are there only for a caller who can edit, and absent rather than null for anyone else. |
+| `DELETE /documents/{id}/watches/{watchId}` | Deletes a watch and its readings and notifications, edit role only. |
+| `GET /documents/{id}/watches/{watchId}/readings?since=<rfc3339>&limit=` | The watch's readings, oldest first, after `since`. |
 | `GET /documents/{id}/assets` | What every asset the document's feeds report is doing now. |
 | `GET /documents/{id}/assets/at?t=<rfc3339>` | The same as of `t`. A missing or unparsable `t` is a 400. |
 | `GET /attachments/{token}` | Reads an attachment. No credential beyond the token. |
@@ -300,6 +305,44 @@ Nothing caps how many feeds a document holds or how many assets a feed reports,
 so the rate limit and the retention window are the only bounds on how many rows
 a feed can write.
 
+## Region watches
+
+A watch is a region of the map, reduced over one geoplumb layer on a schedule.
+An editor draws the region and names the layer, the reducer and how often to
+run:
+
+```
+POST /documents/{id}/watches
+Authorization: Bearer <platform jwt>
+
+{
+  "name": "reservoir",
+  "layer": "ndvi",
+  "region": {"type": "Polygon", "coordinates": [[[...]]]},
+  "reducer": "mean",
+  "intervalSeconds": 3600,
+  "thresholdOp": "lt",
+  "thresholdValue": 0.4,
+  "webhookUrl": "https://hooks.example.test/basin",
+  "webhookSecret": "..."
+}
+```
+
+`region` is a GeoJSON `Polygon` or `MultiPolygon` in lon/lat degrees. `reducer`
+is one of `mean`, `min`, `max`, `sum` or `count`. `thresholdOp` is `gt` or `lt`
+and comes with a `thresholdValue` or not at all: a watch with no threshold
+records its readings and alerts nobody. The webhook is optional, and both halves
+of it come back only to a caller who can edit.
+
+The layer is checked against `GET {GEOPLUMB_URL}/layers` while the create is
+still in flight, so a name geoplumb does not serve is a 422 naming it rather
+than a watch that fails every interval. A geoplumb that does not answer is a
+503, since a watch stored against an unchecked layer is a watch nobody knows is
+broken.
+
+Watches belong to the document rather than to whoever made one, so any editor
+can delete one, and deleting the document takes them with it.
+
 ## Websocket
 
 `GET /ws?doc=<id>` and optionally `&since=<seq>`.
@@ -434,6 +477,12 @@ one is an `error` message or a 4xx, never a panic.
 | Asset id and reading kind | 128 bytes each |
 | Readings in one ingest frame | 256 |
 | Readings per ingest connection | 200 per second, so a frame at the 256 cap is refused by the rate limit first |
+| Watch name | 200 bytes, the same as a document name |
+| Watch interval | 60 seconds or more |
+| Watch region | 4000 ring positions and 256 KiB of JSON, both under what geoplumb reduces |
+| Layer name | 128 bytes of letters, digits, `-` and `_`, so it stays one url path segment |
+| Webhook url and secret | 2048 and 256 bytes |
+| Watch readings per list call | 500 |
 
 Share link tokens are 128 random bits and attachment tokens 256, url safe.
 Session tokens expire after 12 hours and feed tokens after ten years, since a

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use agora_server::auth::AuthConfig;
 use agora_server::projects::{PTOLEMY_URL_ENV, ProjectAccess};
+use agora_server::watches::{GEOPLUMB_URL_ENV, Geoplumb};
 use agora_server::{
     AppState, DATABASE_URL_ENV, DEFAULT_PORT, PORT_ENV, assets, attachments, connect_pool, migrate,
     router,
@@ -18,6 +19,7 @@ async fn main() {
 async fn start() -> Result<(), String> {
     let auth = AuthConfig::from_env()?;
     let projects = ProjectAccess::from_env()?;
+    let geoplumb = Geoplumb::from_env()?;
     let database_url =
         std::env::var(DATABASE_URL_ENV).map_err(|_| format!("{DATABASE_URL_ENV} is not set"))?;
 
@@ -43,16 +45,18 @@ async fn start() -> Result<(), String> {
         .map_err(|error| format!("could not bind {bind}: {error}"))?;
     println!("agora listening on {bind}");
 
-    let state = match projects {
-        Some(projects) => AppState::new(pool, auth).with_projects(projects),
-        None => {
-            println!(
-                "{PTOLEMY_URL_ENV} is not set: project roles grant nothing and only agora's own \
-                 members reach a document"
-            );
-            AppState::new(pool, auth)
-        }
-    };
+    let mut state = AppState::new(pool, auth);
+    match projects {
+        Some(projects) => state = state.with_projects(projects),
+        None => println!(
+            "{PTOLEMY_URL_ENV} is not set: project roles grant nothing and only agora's own \
+             members reach a document"
+        ),
+    }
+    match geoplumb {
+        Some(geoplumb) => state = state.with_geoplumb(geoplumb),
+        None => println!("{GEOPLUMB_URL_ENV} is not set: region watches are off"),
+    }
     tokio::spawn(assets::mark_stale_periodically(Arc::clone(&state.rooms)));
 
     axum::serve(listener, router(state))

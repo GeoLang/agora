@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::role::DocumentRole;
@@ -142,6 +143,96 @@ pub struct AssetState {
     pub feed: Uuid,
     pub online: bool,
     pub values: Vec<AssetValue>,
+}
+
+/// What a watch reduces its region to. One of geoplumb's zonal row fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reducer {
+    Mean,
+    Min,
+    Max,
+    Sum,
+    Count,
+}
+
+impl Reducer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reducer::Mean => "mean",
+            Reducer::Min => "min",
+            Reducer::Max => "max",
+            Reducer::Sum => "sum",
+            Reducer::Count => "count",
+        }
+    }
+
+    /// Read a stored reducer, `None` for anything else. A row the check
+    /// constraint should have refused reaches nothing rather than a default.
+    pub fn parse(reducer: &str) -> Option<Reducer> {
+        match reducer {
+            "mean" => Some(Reducer::Mean),
+            "min" => Some(Reducer::Min),
+            "max" => Some(Reducer::Max),
+            "sum" => Some(Reducer::Sum),
+            "count" => Some(Reducer::Count),
+            _ => None,
+        }
+    }
+}
+
+/// Which side of its threshold a watch is watching for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThresholdOp {
+    Gt,
+    Lt,
+}
+
+impl ThresholdOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThresholdOp::Gt => "gt",
+            ThresholdOp::Lt => "lt",
+        }
+    }
+
+    pub fn parse(op: &str) -> Option<ThresholdOp> {
+        match op {
+            "gt" => Some(ThresholdOp::Gt),
+            "lt" => Some(ThresholdOp::Lt),
+            _ => None,
+        }
+    }
+
+    pub fn satisfied(self, value: f64, threshold: f64) -> bool {
+        match self {
+            ThresholdOp::Gt => value > threshold,
+            ThresholdOp::Lt => value < threshold,
+        }
+    }
+}
+
+/// One region watch as everyone on the document sees it. It carries no webhook
+/// url and no webhook secret, which is what makes it safe to relay: a share
+/// link guest is on this socket too.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchState {
+    pub id: Uuid,
+    pub name: String,
+    pub layer: String,
+    pub region: Value,
+    pub reducer: Reducer,
+    pub interval_seconds: i32,
+    pub threshold_op: Option<ThresholdOp>,
+    pub threshold_value: Option<f64>,
+    pub created_by: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_run_at: Option<OffsetDateTime>,
+    pub last_error: Option<String>,
 }
 
 /// One op the server has ordered, as it appears inside a relayed batch. Each

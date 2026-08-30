@@ -8,12 +8,14 @@ use agora_server::limits::{
     ATTACHMENT_GRACE_DAYS, MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND,
     MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_FEED_READINGS_PER_FRAME,
     MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT,
-    MAX_PRESENCE_BYTES, MAX_USER_ID_BYTES, READINGS_RETENTION_DAYS,
+    MAX_PRESENCE_BYTES, MAX_REGION_POSITIONS, MAX_USER_ID_BYTES, MAX_WATCH_READINGS_PAGE,
+    MIN_WATCH_INTERVAL_SECONDS, READINGS_RETENTION_DAYS,
 };
 use agora_server::projects::ProjectAccess;
 use agora_server::protocol::{BatchOp, OpValue, Peer};
 use agora_server::role::DocumentRole;
 use agora_server::state::META_NAME_KEY;
+use agora_server::watches::Geoplumb;
 use agora_server::{AppState, migrate, router};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -1636,11 +1638,17 @@ async fn the_rate_limit_refuses_a_flood_and_keeps_the_connection() {
     flooder
         .send_op(1, "layers/after", json!({"order": "a0"}))
         .await;
-    let reply = flooder.next_message().await;
-    assert!(
-        matches!(reply["type"].as_str(), Some("ack") | Some("error")),
-        "the connection stopped answering: {reply}"
-    );
+    // once the flood's rate limit window has run out the op is applied, and
+    // then its own echo races the ack, so either can arrive first
+    for _ in 0..8 {
+        let reply = flooder.next_message().await;
+        match reply["type"].as_str() {
+            Some("ack") | Some("error") => return,
+            Some("op") => continue,
+            _ => panic!("the connection stopped answering: {reply}"),
+        }
+    }
+    panic!("the op after the flood was never answered");
 }
 
 #[tokio::test]
@@ -5129,4 +5137,551 @@ async fn an_unknown_query_key_on_either_socket_is_refused() {
             "{url}"
         );
     }
+}
+
+// ── Region watches ────────────────────────────────────────────────────────
+
+/// The one layer the geoplumb stub serves, so a watch naming anything else is
+/// an unknown layer.
+const STUB_LAYER: &str = "hillshade";
+
+/// A stand in for geoplumb, the one external boundary a watch crosses.
+struct GeoplumbStub {
+    base_url: String,
+}
+
+async fn stub_layers() -> axum::Json<Value> {
+    axum::Json(json!([{"name": STUB_LAYER, "source": "cog", "collection": null}]))
+}
+
+async fn spawn_geoplumb_stub() -> GeoplumbStub {
+    // exactly the pinned paths and nothing else, so a client asking elsewhere
+    // gets a 404 and every watch test fails
+    let router = axum::Router::new().route("/layers", axum::routing::get(stub_layers));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub");
+    let address = listener.local_addr().expect("stub address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    GeoplumbStub {
+        base_url: format!("http://{address}"),
+    }
+}
+
+async fn spawn_app_with_geoplumb(stub: &GeoplumbStub) -> TestApp {
+    let auth = AuthConfig::new(TEST_SECRET).expect("test secret is long enough");
+    let geoplumb = Geoplumb::new(&stub.base_url).expect("the stub url is usable");
+    serve(AppState::new(test_pool().await, auth).with_geoplumb(geoplumb)).await
+}
+
+fn region() -> Value {
+    json!({
+        "type": "Polygon",
+        "coordinates": [[[0.0, 0.0], [0.1, 0.0], [0.1, 0.1], [0.0, 0.0]]]
+    })
+}
+
+fn watch_body() -> Value {
+    json!({
+        "name": "reservoir",
+        "layer": STUB_LAYER,
+        "region": region(),
+        "reducer": "mean",
+        "intervalSeconds": MIN_WATCH_INTERVAL_SECONDS,
+    })
+}
+
+async fn create_watch(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    body: &Value,
+) -> reqwest::Response {
+    app.client
+        .post(format!("{}/documents/{document_id}/watches", app.http_base))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .expect("create watch")
+}
+
+async fn created_watch(app: &TestApp, token: &str, document_id: Uuid, body: &Value) -> Uuid {
+    let response = create_watch(app, token, document_id, body).await;
+    assert_eq!(response.status(), 201);
+    let created: Value = response.json().await.expect("json body");
+    Uuid::parse_str(created["id"].as_str().expect("a watch id")).expect("a uuid")
+}
+
+async fn list_watches(app: &TestApp, token: &str, document_id: Uuid) -> reqwest::Response {
+    app.client
+        .get(format!("{}/documents/{document_id}/watches", app.http_base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list watches")
+}
+
+async fn delete_watch(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    watch_id: Uuid,
+) -> reqwest::Response {
+    app.client
+        .delete(format!(
+            "{}/documents/{document_id}/watches/{watch_id}",
+            app.http_base
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("delete watch")
+}
+
+async fn list_watch_readings(
+    app: &TestApp,
+    token: &str,
+    document_id: Uuid,
+    watch_id: Uuid,
+    query: &str,
+) -> reqwest::Response {
+    app.client
+        .get(format!(
+            "{}/documents/{document_id}/watches/{watch_id}/readings{query}",
+            app.http_base
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list watch readings")
+}
+
+#[tokio::test]
+async fn an_editor_creates_a_watch_lists_it_and_deletes_it() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    let response = create_watch(&app, &owner_token, document_id, &watch_body()).await;
+    assert_eq!(response.status(), 201);
+    let created: Value = response.json().await.expect("json body");
+    assert_eq!(created["name"], "reservoir");
+    assert_eq!(created["layer"], STUB_LAYER);
+    assert_eq!(created["reducer"], "mean");
+    assert_eq!(created["intervalSeconds"], MIN_WATCH_INTERVAL_SECONDS);
+    assert_eq!(created["region"], region());
+    assert_eq!(created["createdBy"], owner.as_str());
+    assert_eq!(created["thresholdOp"], Value::Null);
+    assert_eq!(created["lastRunAt"], Value::Null);
+    assert_eq!(created["lastError"], Value::Null);
+    let watch_id = Uuid::parse_str(created["id"].as_str().expect("a watch id")).expect("a uuid");
+
+    let listed: Value = list_watches(&app, &owner_token, document_id)
+        .await
+        .json()
+        .await
+        .expect("json");
+    let listed = listed.as_array().expect("an array").clone();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], created["id"]);
+
+    assert_eq!(
+        delete_watch(&app, &owner_token, document_id, watch_id)
+            .await
+            .status(),
+        204
+    );
+    let listed: Value = list_watches(&app, &owner_token, document_id)
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert!(listed.as_array().expect("an array").is_empty());
+}
+
+#[tokio::test]
+async fn only_an_editor_creates_or_deletes_a_watch() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let viewer = fresh_user();
+    set_member(&app, &owner_token, document_id, &viewer, "view").await;
+    let viewer_token = platform_token(&viewer);
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+
+    assert_eq!(
+        create_watch(&app, &viewer_token, document_id, &watch_body())
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        delete_watch(&app, &viewer_token, document_id, watch_id)
+            .await
+            .status(),
+        403
+    );
+    // a viewer still reads the listing and the history
+    assert_eq!(
+        list_watches(&app, &viewer_token, document_id)
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        list_watch_readings(&app, &viewer_token, document_id, watch_id, "")
+            .await
+            .status(),
+        200
+    );
+
+    let stranger_token = platform_token(&fresh_user());
+    assert_eq!(
+        create_watch(&app, &stranger_token, document_id, &watch_body())
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        list_watches(&app, &stranger_token, document_id)
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        list_watch_readings(&app, &stranger_token, document_id, watch_id, "")
+            .await
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn the_webhook_reaches_an_editor_and_nobody_else() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let viewer = fresh_user();
+    set_member(&app, &owner_token, document_id, &viewer, "view").await;
+    let viewer_token = platform_token(&viewer);
+
+    let mut body = watch_body();
+    body["webhookUrl"] = json!("https://hooks.example.test/basin");
+    body["webhookSecret"] = json!("a shared signing secret");
+    let response = create_watch(&app, &owner_token, document_id, &body).await;
+    assert_eq!(response.status(), 201);
+    let created: Value = response.json().await.expect("json body");
+    assert_eq!(created["webhookUrl"], "https://hooks.example.test/basin");
+    assert_eq!(created["webhookSecret"], "a shared signing secret");
+
+    let seen_by_editor: Value = list_watches(&app, &owner_token, document_id)
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        seen_by_editor[0]["webhookUrl"],
+        "https://hooks.example.test/basin"
+    );
+
+    let seen_by_viewer: Value = list_watches(&app, &viewer_token, document_id)
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        seen_by_viewer[0].get("webhookUrl").is_none(),
+        "a viewer was handed the webhook url"
+    );
+    assert!(
+        seen_by_viewer[0].get("webhookSecret").is_none(),
+        "a viewer was handed the webhook secret"
+    );
+    assert_eq!(seen_by_viewer[0]["name"], "reservoir");
+}
+
+#[tokio::test]
+async fn a_watch_naming_a_layer_geoplumb_does_not_serve_is_refused() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    let mut body = watch_body();
+    body["layer"] = json!("no-such-layer");
+    let response = create_watch(&app, &owner_token, document_id, &body).await;
+    assert_eq!(response.status(), 422);
+    let refusal: Value = response.json().await.expect("json body");
+    assert!(
+        refusal["error"]
+            .as_str()
+            .expect("a reason")
+            .contains("no-such-layer"),
+        "the refusal did not name the layer: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_watch_is_refused_when_geoplumb_is_not_configured() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    assert_eq!(
+        create_watch(&app, &owner_token, document_id, &watch_body())
+            .await
+            .status(),
+        400
+    );
+}
+
+#[tokio::test]
+async fn a_watch_name_layer_region_interval_threshold_and_webhook_are_bounded() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    let mut refused = Vec::new();
+    for (field, value) in [
+        ("name", json!("")),
+        ("name", json!("   ")),
+        ("name", json!("line\nbreak")),
+        ("name", json!("a".repeat(MAX_DOCUMENT_NAME_BYTES + 1))),
+        ("layer", json!("")),
+        ("layer", json!("../etc/passwd")),
+        ("layer", json!("two words")),
+        ("intervalSeconds", json!(MIN_WATCH_INTERVAL_SECONDS - 1)),
+        ("intervalSeconds", json!(0)),
+        ("intervalSeconds", json!(-60)),
+        (
+            "region",
+            json!({"type": "Point", "coordinates": [0.0, 0.0]}),
+        ),
+        (
+            "region",
+            json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 0.0]]]}),
+        ),
+        (
+            "region",
+            json!({"type": "Polygon", "coordinates": [[[181.0, 0.0], [1.0, 0.0], [1.0, 1.0], [181.0, 0.0]]]}),
+        ),
+        ("thresholdOp", json!("gt")),
+        ("webhookUrl", json!("file:///etc/passwd")),
+        ("webhookUrl", json!("not a url")),
+        ("webhookSecret", json!("")),
+    ] {
+        let mut body = watch_body();
+        body[field] = value.clone();
+        let status = create_watch(&app, &owner_token, document_id, &body)
+            .await
+            .status()
+            .as_u16();
+        if status != 400 {
+            refused.push(format!("{field} = {value} answered {status}"));
+        }
+    }
+    assert!(refused.is_empty(), "{refused:?}");
+
+    // a threshold needs both halves, and then it is taken
+    let mut body = watch_body();
+    body["thresholdOp"] = json!("gt");
+    body["thresholdValue"] = json!(0.4);
+    let response = create_watch(&app, &owner_token, document_id, &body).await;
+    assert_eq!(response.status(), 201);
+    let created: Value = response.json().await.expect("json body");
+    assert_eq!(created["thresholdOp"], "gt");
+    assert_eq!(created["thresholdValue"], 0.4);
+}
+
+#[tokio::test]
+async fn a_region_past_the_position_cap_is_refused() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    let ring: Vec<Value> = (0..=MAX_REGION_POSITIONS)
+        .map(|index| json!([(index % 90) as f64 * 0.001, 0.0]))
+        .collect();
+    let mut body = watch_body();
+    body["region"] = json!({"type": "Polygon", "coordinates": [ring]});
+    assert_eq!(
+        create_watch(&app, &owner_token, document_id, &body)
+            .await
+            .status(),
+        400
+    );
+}
+
+#[tokio::test]
+async fn a_reducer_or_threshold_operator_outside_the_set_is_refused() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    let mut body = watch_body();
+    body["reducer"] = json!("median");
+    assert_eq!(
+        create_watch(&app, &owner_token, document_id, &body)
+            .await
+            .status(),
+        UNKNOWN_BODY_KEY_STATUS
+    );
+
+    let mut body = watch_body();
+    body["thresholdOp"] = json!("ge");
+    body["thresholdValue"] = json!(1.0);
+    assert_eq!(
+        create_watch(&app, &owner_token, document_id, &body)
+            .await
+            .status(),
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_key_on_create_watch_is_refused() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "basin").await;
+
+    let mut body = watch_body();
+    body["interval_seconds"] = json!(MIN_WATCH_INTERVAL_SECONDS);
+    assert_eq!(
+        create_watch(&app, &token, document_id, &body)
+            .await
+            .status(),
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn a_watch_on_another_document_is_not_found() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let mine = create_document(&app, &owner_token, "mine").await;
+    let other = create_document(&app, &owner_token, "other").await;
+    let watch_id = created_watch(&app, &owner_token, mine, &watch_body()).await;
+
+    assert_eq!(
+        delete_watch(&app, &owner_token, other, watch_id)
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        delete_watch(&app, &owner_token, mine, Uuid::new_v4())
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        list_watch_readings(&app, &owner_token, other, watch_id, "")
+            .await
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_watch_history_starts_empty_and_bounds_its_query() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+
+    let response = list_watch_readings(&app, &owner_token, document_id, watch_id, "").await;
+    assert_eq!(response.status(), 200);
+    let readings: Value = response.json().await.expect("json");
+    assert!(readings.as_array().expect("an array").is_empty());
+
+    for query in [
+        "?since=yesterday",
+        "?limit=0",
+        &format!("?limit={}", MAX_WATCH_READINGS_PAGE + 1),
+    ] {
+        assert_eq!(
+            list_watch_readings(&app, &owner_token, document_id, watch_id, query)
+                .await
+                .status(),
+            400,
+            "{query}"
+        );
+    }
+    assert_eq!(
+        list_watch_readings(
+            &app,
+            &owner_token,
+            document_id,
+            watch_id,
+            "?since=2026-08-30T00:00:00Z&limit=10"
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        list_watch_readings(&app, &owner_token, document_id, watch_id, "?cacheBust=1")
+            .await
+            .status(),
+        UNKNOWN_QUERY_KEY_STATUS
+    );
+}
+
+/// A guest holds a session token and never a platform one, so every watch route
+/// answers them exactly what `POST /documents` does.
+#[tokio::test]
+async fn a_session_token_reaches_no_watch_route() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+    let session = guest_session(&app, &owner_token, document_id, "edit").await;
+
+    let baseline = app
+        .client
+        .post(format!("{}/documents", app.http_base))
+        .bearer_auth(&session)
+        .json(&json!({"name": "not allowed"}))
+        .send()
+        .await
+        .expect("create attempt")
+        .status()
+        .as_u16();
+    assert_eq!(baseline, 401);
+
+    assert_eq!(
+        create_watch(&app, &session, document_id, &watch_body())
+            .await
+            .status(),
+        baseline
+    );
+    assert_eq!(
+        list_watches(&app, &session, document_id).await.status(),
+        baseline
+    );
+    assert_eq!(
+        delete_watch(&app, &session, document_id, watch_id)
+            .await
+            .status(),
+        baseline
+    );
+    assert_eq!(
+        list_watch_readings(&app, &session, document_id, watch_id, "")
+            .await
+            .status(),
+        baseline
+    );
 }

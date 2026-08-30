@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod role;
 pub mod room;
 pub mod state;
+pub mod watches;
 pub mod ws;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use tower_http::cors::CorsLayer;
 use crate::auth::AuthConfig;
 use crate::projects::ProjectAccess;
 use crate::room::RoomRegistry;
+use crate::watches::Geoplumb;
 
 pub const DATABASE_URL_ENV: &str = "DATABASE_URL";
 pub const PORT_ENV: &str = "PORT";
@@ -45,6 +47,9 @@ pub struct AppState {
     /// `None` leaves the members table as the only authority on every document,
     /// which is where a build with no [`projects::PTOLEMY_URL_ENV`] lands.
     pub projects: Option<Arc<ProjectAccess>>,
+    /// `None` turns region watches off, which is where a build with no
+    /// [`watches::GEOPLUMB_URL_ENV`] lands.
+    pub geoplumb: Option<Arc<Geoplumb>>,
 }
 
 impl AppState {
@@ -57,11 +62,17 @@ impl AppState {
             auth,
             rooms: Arc::new(RoomRegistry::new()),
             projects: None,
+            geoplumb: None,
         }
     }
 
     pub fn with_projects(mut self, projects: ProjectAccess) -> Self {
         self.projects = Some(Arc::new(projects));
+        self
+    }
+
+    pub fn with_geoplumb(mut self, geoplumb: Geoplumb) -> Self {
+        self.geoplumb = Some(Arc::new(geoplumb));
         self
     }
 }
@@ -102,6 +113,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/documents/{id}/feeds/{feed_id}",
             delete(feeds::delete_feed),
+        )
+        .route(
+            "/documents/{id}/watches",
+            post(watches::create_watch).get(watches::list_watches),
+        )
+        .route(
+            "/documents/{id}/watches/{watch_id}",
+            delete(watches::delete_watch),
+        )
+        .route(
+            "/documents/{id}/watches/{watch_id}/readings",
+            get(watches::list_watch_readings),
         )
         .route("/documents/{id}/assets", get(assets::list_assets))
         .route("/documents/{id}/assets/at", get(assets::list_assets_at))
