@@ -231,6 +231,7 @@ pub async fn list_assets(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AtQuery {
     t: Option<String>,
 }

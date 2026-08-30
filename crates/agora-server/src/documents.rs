@@ -151,7 +151,7 @@ async fn require_project_editor(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateDocumentRequest {
     name: String,
     #[serde(default)]
@@ -342,7 +342,7 @@ pub async fn get_document(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SetProjectRequest {
     /// `null` unlinks the document.
     project_id: Option<Uuid>,
@@ -419,6 +419,7 @@ fn is_the_last_editor(editors: &[String], user_id: &str) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetMemberRequest {
     role: DocumentRole,
 }

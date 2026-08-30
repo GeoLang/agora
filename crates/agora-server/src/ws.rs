@@ -32,6 +32,7 @@ pub const GUEST_NAME: &str = "guest";
 
 /// No `Debug`: `token` is a bearer credential and must never reach a log line.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebsocketQuery {
     doc: Uuid,
     since: Option<u64>,

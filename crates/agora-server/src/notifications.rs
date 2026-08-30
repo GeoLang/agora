@@ -155,6 +155,7 @@ pub async fn list_notifications(
 /// `ids` marks just those notifications, absent marks everything unread. Ids
 /// belonging to someone else are simply not matched.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MarkReadRequest {
     ids: Option<Vec<Uuid>>,
 }

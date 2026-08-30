@@ -48,7 +48,7 @@ pub async fn feed(pool: &PgPool, feed_id: Uuid) -> Result<Option<Feed>, sqlx::Er
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateFeedRequest {
     name: String,
     interval_seconds: i32,
@@ -176,6 +176,7 @@ pub async fn delete_feed(
 
 /// No `Debug`: `token` is a bearer credential and must never reach a log line.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestQuery {
     token: Option<String>,
 }

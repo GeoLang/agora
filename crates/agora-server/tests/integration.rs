@@ -1261,6 +1261,7 @@ async fn presence_reaches_the_others_with_a_server_actor_and_never_the_sender() 
     let guest_actor = snapshot["actor"].as_str().expect("an actor").to_string();
     owner_client.expect_message("peers").await;
 
+    // claiming an actor is refused outright rather than ignored
     guest_client
         .send(json!({
             "type": "presence",
@@ -1268,6 +1269,19 @@ async fn presence_reaches_the_others_with_a_server_actor_and_never_the_sender() 
             "selection": ["layers/roads"],
             "viewport": {"zoom": 6},
             "actor": "someone-else"
+        }))
+        .await;
+    assert_eq!(
+        guest_client.expect_message("error").await["reason"],
+        json!("malformed message")
+    );
+
+    guest_client
+        .send(json!({
+            "type": "presence",
+            "cursor": [12.5, -3.25],
+            "selection": ["layers/roads"],
+            "viewport": {"zoom": 6}
         }))
         .await;
 
@@ -4940,4 +4954,179 @@ async fn the_sweep_deletes_readings_past_the_retention_window() {
         .await
         .expect("sweep readings");
     assert_eq!(stored_assets(&app, feed_id).await, vec!["recent"]);
+}
+
+/// A body serde cannot deserialize reaches axum's `Json` rejection, which is
+/// 422, the same answer a missing field already gets. A query string reaches
+/// the `Query` rejection instead, which is 400.
+const UNKNOWN_BODY_KEY_STATUS: u16 = 422;
+const UNKNOWN_QUERY_KEY_STATUS: u16 = 400;
+
+async fn status_of(request: reqwest::RequestBuilder) -> u16 {
+    request.send().await.expect("send").status().as_u16()
+}
+
+/// The bug DESIGN_TODO records: a client sending `project_id` where the server
+/// reads `projectId` used to create a document with no project and say nothing.
+#[tokio::test]
+async fn an_unknown_key_on_create_document_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    assert_eq!(
+        status_of(
+            app.client
+                .post(format!("{}/documents", app.http_base))
+                .bearer_auth(&token)
+                .json(&json!({"name": "twins", "project_id": Uuid::new_v4()}))
+        )
+        .await,
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_key_on_set_document_project_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    assert_eq!(
+        status_of(
+            app.client
+                .put(format!("{}/documents/{document_id}/project", app.http_base))
+                .bearer_auth(&token)
+                .json(&json!({"projectId": null, "project_id": null}))
+        )
+        .await,
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_key_on_set_member_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let member = fresh_user();
+    assert_eq!(
+        status_of(
+            app.client
+                .put(format!(
+                    "{}/documents/{document_id}/members/{member}",
+                    app.http_base
+                ))
+                .bearer_auth(&token)
+                .json(&json!({"role": "edit", "expiresAt": "2027-01-01T00:00:00Z"}))
+        )
+        .await,
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_key_on_create_link_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    assert_eq!(
+        status_of(
+            app.client
+                .post(format!("{}/documents/{document_id}/links", app.http_base))
+                .bearer_auth(&token)
+                .json(&json!({"role": "view", "uses": 1}))
+        )
+        .await,
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_key_on_create_feed_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    assert_eq!(
+        status_of(
+            app.client
+                .post(format!("{}/documents/{document_id}/feeds", app.http_base))
+                .bearer_auth(&token)
+                .json(&json!({"name": "sensors", "intervalSeconds": 5, "interval_seconds": 5}))
+        )
+        .await,
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_key_on_mark_notifications_read_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    assert_eq!(
+        status_of(
+            app.client
+                .post(format!("{}/notifications/read", app.http_base))
+                .bearer_auth(&token)
+                .json(&json!({"ids": [], "all": true}))
+        )
+        .await,
+        UNKNOWN_BODY_KEY_STATUS
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_query_key_on_assets_at_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+    let at = "2026-08-25T12:00:00Z";
+    assert_eq!(
+        status_of(
+            app.client
+                .get(format!(
+                    "{}/documents/{document_id}/assets/at?t={at}",
+                    app.http_base
+                ))
+                .bearer_auth(&token)
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        status_of(
+            app.client
+                .get(format!(
+                    "{}/documents/{document_id}/assets/at?t={at}&cacheBust=1",
+                    app.http_base
+                ))
+                .bearer_auth(&token)
+        )
+        .await,
+        UNKNOWN_QUERY_KEY_STATUS
+    );
+}
+
+/// Both socket queries are refused before the token is read, so an unknown key
+/// answers 400 rather than the 401 an anonymous handshake gets.
+#[tokio::test]
+async fn an_unknown_query_key_on_either_socket_is_refused() {
+    let app = spawn_app().await;
+    let token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &token, "twins").await;
+
+    for url in [
+        format!(
+            "{}/ws?doc={document_id}&token={token}&cacheBust=1",
+            app.websocket_base
+        ),
+        format!("{}/feeds/ws?token={token}&cacheBust=1", app.websocket_base),
+    ] {
+        assert_eq!(
+            handshake_status(
+                connect_async(url.clone())
+                    .await
+                    .map(|(stream, response)| (WebsocketClient { stream }, response))
+            ),
+            Some(UNKNOWN_QUERY_KEY_STATUS),
+            "{url}"
+        );
+    }
 }

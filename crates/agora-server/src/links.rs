@@ -42,6 +42,7 @@ pub async fn live_link(pool: &PgPool, token: &str) -> Result<Option<ShareLink>, 
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateLinkRequest {
     role: DocumentRole,
 }

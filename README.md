@@ -137,6 +137,12 @@ anything else.
 | `GET /notifications` | The caller's latest 50 mention notifications, newest first. Hard capped, with no pagination and no total count, so a caller past 50 unread never sees the rest. |
 | `POST /notifications/read` `{"ids": ["..."]}` | Marks the caller's notifications read, every unread one when `ids` is absent. |
 
+Bodies and query strings are read strictly. A key the route does not define is
+refused rather than ignored, so a client sending `project_id` where the route
+reads `projectId` is told, instead of creating a document with no project. An
+unknown body key is a 422, the same answer a missing or mistyped field already
+gets, and an unknown query key is a 400.
+
 `sessionToken` is a short lived HS256 JWT carrying the document, the role and a
 random anonymous actor id. It is not a platform token and is refused everywhere a
 platform token is required, so a share link cannot create documents or mint
@@ -252,6 +258,10 @@ device with no clock relies on. `asset` and `kind` are opaque ids the feed
 chooses, carrying no whitespace and no control characters. `value` is a finite
 number.
 
+A key not listed here is ignored rather than refused, which is the one place
+agora tolerates one. Feeds are devices nobody here controls, and a firmware that
+adds a field must not start losing readings.
+
 An accepted frame answers `{"type": "ack", "count": 5}`, counting the readings
 it carried, and goes out to everyone on the document as a `readings` frame. A
 reading that repeats one already stored is dropped, so a feed replaying after a
@@ -331,6 +341,11 @@ the tail.
 
 `value: null` deletes the key. The field is required, so a message that omits it
 is refused rather than deleting anything.
+
+A frame on this socket carrying a key its type does not define is a `malformed
+message` error. That covers `actor` on a `presence` frame and `seq` on an op,
+both of which the server decides and a client may not claim. The ingest socket
+is the exception and ignores an unknown key, described under Feeds above.
 
 A `batch` is several ops the server applies all or nothing, which is what keeps a
 multi feature paste or a multi layer reorder from rendering half done on a peer.

@@ -4,6 +4,18 @@
 
 ### Added
 
+- 2026-08-30: **an unknown key is refused instead of ignored**. Every request
+  body, query string and document socket frame now carries
+  `serde(deny_unknown_fields)`, so a key the type does not define is an error
+  rather than a silent no-op. A body key is a 422, the answer a missing field
+  already gets, and a query key is a 400. On the socket it is a `malformed
+  message` error, which also stops a client claiming `actor` on a `presence`
+  frame. This is what turns a misspelling like `project_id` for `projectId` into
+  a refusal instead of a document created with no project. The ingest wire
+  format is the exception and stays tolerant: `readings` frames come from
+  devices nobody here controls, and a firmware that adds a field must not start
+  losing readings.
+
 - 2026-08-25: **sensor feeds and asset liveness**. A document can register feeds
   (`POST /documents/{id}/feeds`, migration 008), each getting a token that
   reaches one new socket, `GET /feeds/ws`, and nothing else: every existing route

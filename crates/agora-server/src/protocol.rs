@@ -41,6 +41,7 @@ impl<'de> Deserialize<'de> for OpValue {
 /// One entry of a batch: what an op carries minus the `clientSeq`, which the
 /// frame holds once for the whole batch.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchOp {
     pub key: String,
     pub value: OpValue,
@@ -48,7 +49,7 @@ pub struct BatchOp {
 
 /// A message a client may send.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ClientMessage {
     Op {
         #[serde(rename = "clientSeq")]
@@ -74,6 +75,10 @@ pub enum ClientMessage {
 }
 
 /// A message a sensor feed may send on the ingest socket.
+///
+/// Unknown keys are tolerated here, unlike everywhere else agora reads input.
+/// The senders are devices nobody on this side controls, and a firmware that
+/// adds a field must not start losing readings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum FeedMessage {
@@ -314,6 +319,33 @@ mod tests {
             r#"{"type":"batch","ops":[]}"#,
             r#"{"type":"batch","clientSeq":9,"ops":{"key":"layers/a","value":null}}"#,
             r#"{"type":"batch","clientSeq":9,"ops":[{"value":null}]}"#,
+        ] {
+            assert!(parse(text).is_err(), "{text:?}");
+        }
+    }
+
+    /// Every shape the viewer and the python client send, so the strictness
+    /// above cannot start refusing a frame either of them still produces.
+    #[test]
+    fn the_frames_our_clients_send_still_parse() {
+        for text in [
+            r#"{"type":"op","clientSeq":1,"key":"layers/a","value":{"order":"a0"}}"#,
+            r#"{"type":"op","clientSeq":1,"key":"comments/c1","value":null}"#,
+            r#"{"type":"batch","clientSeq":2,"ops":[{"key":"layers/a","value":1},{"key":"layers/b","value":null}]}"#,
+            r#"{"type":"presence","cursor":[1.0,2.0],"selection":[],"viewport":{"center":[1.0,2.0],"zoom":4}}"#,
+            r#"{"type":"presence","cursor":null,"selection":[],"viewport":null}"#,
+        ] {
+            assert!(parse(text).is_ok(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_on_a_client_message_is_refused() {
+        for text in [
+            r#"{"type":"op","clientSeq":1,"key":"layers/a","value":null,"actor":"someone"}"#,
+            r#"{"type":"batch","clientSeq":1,"ops":[],"seq":9}"#,
+            r#"{"type":"batch","clientSeq":1,"ops":[{"key":"layers/a","value":null,"seq":9}]}"#,
+            r#"{"type":"presence","cursor":null,"selection":[],"viewport":null,"actor":"someone"}"#,
         ] {
             assert!(parse(text).is_err(), "{text:?}");
         }
@@ -561,6 +593,22 @@ mod tests {
         assert_eq!(readings[0].at.as_deref(), Some("2026-08-25T12:00:00Z"));
         assert_eq!(readings[1].value, 0.4);
         assert_eq!(readings[1].at, None);
+    }
+
+    /// The one wire format that stays tolerant. Devices we do not control send
+    /// these, so a firmware that adds a field must not lose its readings.
+    #[test]
+    fn an_ingest_frame_keeps_its_readings_when_it_carries_an_unknown_key() {
+        let parsed: FeedMessage = serde_json::from_str(
+            r#"{"type":"readings","feed":"f1","readings":[
+                {"asset":"TWIN-03","kind":"temperature","value":21.5,"unit":"C"}
+            ]}"#,
+        )
+        .unwrap();
+        let FeedMessage::Readings { readings } = parsed;
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].asset, "TWIN-03");
+        assert_eq!(readings[0].value, 21.5);
     }
 
     #[test]
