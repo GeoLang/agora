@@ -5257,6 +5257,10 @@ impl GeoplumbStub {
 /// The scheduler and the readings sweep both walk the whole database rather
 /// than one document, the way the background tasks in the binary do, so one
 /// test drives one of them at a time and never two at once.
+///
+/// A test that asserts a watch has *not* run holds this too: without it another
+/// test's tick reaches its watch, since a fresh watch is due the moment it is
+/// stored.
 static BACKGROUND: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn background_lock() -> tokio::sync::MutexGuard<'static, ()> {
@@ -5755,6 +5759,9 @@ async fn a_watch_on_another_document_is_not_found() {
 
 #[tokio::test]
 async fn a_watch_history_starts_empty_and_bounds_its_query() {
+    // this asserts a watch has not run, and a tick runs every due watch in the
+    // database, so it holds the lock for as long as the watch exists
+    let _background = background_lock().await;
     let stub = spawn_geoplumb_stub().await;
     let app = spawn_app_with_geoplumb(&stub).await;
     let owner_token = platform_token(&fresh_user());
