@@ -8,19 +8,19 @@ use agora_server::limits::{
     ATTACHMENT_GRACE_DAYS, MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND,
     MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_FEED_READINGS_PER_FRAME,
     MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT,
-    MAX_PRESENCE_BYTES, MAX_REGION_POSITIONS, MAX_USER_ID_BYTES, MAX_WATCH_READINGS_PAGE,
-    MIN_WATCH_INTERVAL_SECONDS, READINGS_RETENTION_DAYS,
+    MAX_PRESENCE_BYTES, MAX_READINGS_PER_WATCH, MAX_REGION_POSITIONS, MAX_USER_ID_BYTES,
+    MAX_WATCH_READINGS_PAGE, MIN_WATCH_INTERVAL_SECONDS, READINGS_RETENTION_DAYS,
 };
 use agora_server::projects::ProjectAccess;
 use agora_server::protocol::{BatchOp, OpValue, Peer};
 use agora_server::role::DocumentRole;
 use agora_server::state::META_NAME_KEY;
-use agora_server::watches::Geoplumb;
+use agora_server::watches::{Geoplumb, run_due};
 use agora_server::{AppState, migrate, router};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Response;
@@ -4964,6 +4964,7 @@ async fn a_room_that_loads_after_an_asset_went_quiet_starts_it_offline() {
 
 #[tokio::test]
 async fn the_sweep_deletes_readings_past_the_retention_window() {
+    let _background = background_lock().await;
     let app = spawn_app().await;
     let token = platform_token(&fresh_user());
     let document_id = create_document(&app, &token, "twins").await;
@@ -5160,19 +5161,71 @@ async fn an_unknown_query_key_on_either_socket_is_refused() {
 /// an unknown layer.
 const STUB_LAYER: &str = "hillshade";
 
+/// The reduction the stub answers with unless a test says otherwise.
+const STUB_COUNT: i64 = 4096;
+const STUB_MEAN: f64 = 0.31;
+
 /// A stand in for geoplumb, the one external boundary a watch crosses.
 struct GeoplumbStub {
     base_url: String,
+    state: GeoplumbStubState,
+}
+
+#[derive(Clone)]
+struct GeoplumbStubState {
+    row: Arc<Mutex<Value>>,
+    /// Set to answer this status instead of reducing anything.
+    status: Arc<Mutex<Option<u16>>>,
+    /// Every zonal body the stub was sent, so a test can pin the request shape.
+    bodies: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn stub_layers() -> axum::Json<Value> {
     axum::Json(json!([{"name": STUB_LAYER, "source": "cog", "collection": null}]))
 }
 
+async fn stub_zonal(
+    axum::extract::State(state): axum::extract::State<GeoplumbStubState>,
+    axum::extract::Path(layer): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    state.bodies.lock().expect("stub bodies").push(body);
+    if layer != STUB_LAYER {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("unknown layer {layer}"),
+        )
+            .into_response();
+    }
+    if let Some(status) = *state.status.lock().expect("stub status") {
+        let status = axum::http::StatusCode::from_u16(status).expect("a status code");
+        return (status, "the stub was told to refuse").into_response();
+    }
+    let row = state.row.lock().expect("stub row").clone();
+    axum::Json(json!({"rows": [row]})).into_response()
+}
+
 async fn spawn_geoplumb_stub() -> GeoplumbStub {
+    let state = GeoplumbStubState {
+        row: Arc::new(Mutex::new(json!({
+            "id": 0,
+            "count": STUB_COUNT,
+            "sum": 1269.76,
+            "minimum": 0.1,
+            "maximum": 0.9,
+            "mean": STUB_MEAN
+        }))),
+        status: Arc::new(Mutex::new(None)),
+        bodies: Arc::new(Mutex::new(Vec::new())),
+    };
     // exactly the pinned paths and nothing else, so a client asking elsewhere
     // gets a 404 and every watch test fails
-    let router = axum::Router::new().route("/layers", axum::routing::get(stub_layers));
+    let router = axum::Router::new()
+        .route("/layers", axum::routing::get(stub_layers))
+        .route("/zonal/{layer}", axum::routing::post(stub_zonal))
+        .with_state(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the stub");
@@ -5182,7 +5235,79 @@ async fn spawn_geoplumb_stub() -> GeoplumbStub {
     });
     GeoplumbStub {
         base_url: format!("http://{address}"),
+        state,
     }
+}
+
+impl GeoplumbStub {
+    fn answer_with(&self, status: u16) {
+        *self.state.status.lock().expect("stub status") = Some(status);
+    }
+
+    fn reduce_to(&self, row: Value) {
+        *self.state.row.lock().expect("stub row") = row;
+    }
+
+    fn zonal_bodies(&self) -> Vec<Value> {
+        self.state.bodies.lock().expect("stub bodies").clone()
+    }
+}
+
+/// The scheduler and the readings sweep both walk the whole database rather
+/// than one document, the way the background tasks in the binary do, so one
+/// test drives one of them at a time and never two at once.
+static BACKGROUND: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn background_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    BACKGROUND.lock().await
+}
+
+/// Sort this watch ahead of every leftover in the shared database, so one tick
+/// is certain to reach it.
+async fn make_watch_oldest(app: &TestApp, watch_id: Uuid) {
+    sqlx::query("update watches set created_at = to_timestamp(0) where id = $1")
+        .bind(watch_id)
+        .execute(&app.state.pool)
+        .await
+        .expect("age the watch");
+}
+
+/// Put the watch's last run far enough back that its interval has run out.
+async fn make_watch_due(app: &TestApp, watch_id: Uuid) {
+    sqlx::query("update watches set last_run_at = to_timestamp(0) where id = $1")
+        .bind(watch_id)
+        .execute(&app.state.pool)
+        .await
+        .expect("make the watch due");
+}
+
+async fn watch_run_state(
+    app: &TestApp,
+    watch_id: Uuid,
+) -> (Option<time::OffsetDateTime>, Option<String>) {
+    let row = sqlx::query("select last_run_at, last_error from watches where id = $1")
+        .bind(watch_id)
+        .fetch_one(&app.state.pool)
+        .await
+        .expect("read the watch");
+    (
+        row.try_get("last_run_at").expect("last_run_at"),
+        row.try_get("last_error").expect("last_error"),
+    )
+}
+
+/// Postgres keeps microseconds and `OffsetDateTime::now_utc` carries
+/// nanoseconds, so a stored run time is the one handed in, truncated.
+fn is_the_same_moment(stored: Option<time::OffsetDateTime>, now: time::OffsetDateTime) -> bool {
+    stored.is_some_and(|stored| (now - stored).abs() < time::Duration::microseconds(1))
+}
+
+async fn stored_readings(app: &TestApp, watch_id: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from watch_readings where watch_id = $1")
+        .bind(watch_id)
+        .fetch_one(&app.state.pool)
+        .await
+        .expect("count the readings")
 }
 
 async fn spawn_app_with_geoplumb(stub: &GeoplumbStub) -> TestApp {
@@ -5730,4 +5855,213 @@ async fn a_join_carries_the_documents_watches_and_never_their_webhooks() {
         !rendered.contains("webhook") && !rendered.contains("signing secret"),
         "the watches frame carried a webhook: {rendered}"
     );
+}
+
+#[tokio::test]
+async fn a_due_watch_stores_a_reading_and_relays_it_to_the_room() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+    make_watch_oldest(&app, watch_id).await;
+
+    let mut client = open(&app, document_id, &owner_token, None).await;
+    expect_join(&mut client).await;
+
+    let now = time::OffsetDateTime::now_utc();
+    assert!(run_due(&app.state, now).await >= 1);
+
+    let frame = client.expect_message("watchReading").await;
+    assert_eq!(frame["watch"], watch_id.to_string());
+    assert_eq!(frame["value"], STUB_MEAN);
+    assert_eq!(frame["count"], STUB_COUNT);
+    assert_eq!(frame["tripped"], false);
+
+    let readings: Value = list_watch_readings(&app, &owner_token, document_id, watch_id, "")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let readings = readings.as_array().expect("an array").clone();
+    assert_eq!(readings.len(), 1);
+    assert_eq!(readings[0]["value"], STUB_MEAN);
+    assert_eq!(readings[0]["count"], STUB_COUNT);
+
+    let (last_run_at, last_error) = watch_run_state(&app, watch_id).await;
+    assert!(is_the_same_moment(last_run_at, now), "{last_run_at:?}");
+    assert_eq!(last_error, None);
+
+    // the body geoplumb was sent is the one feature collection its zonal
+    // endpoint reads. a tick runs every due watch in the database, so this
+    // stub may have been asked about more than the one this test made
+    let bodies = stub.zonal_bodies();
+    let sent = bodies
+        .iter()
+        .find(|body| body["features"][0]["geometry"] == region())
+        .expect("the region was never reduced");
+    assert_eq!(sent["type"], "FeatureCollection");
+    assert_eq!(sent["features"].as_array().expect("features").len(), 1);
+    assert_eq!(sent["features"][0]["type"], "Feature");
+    assert_eq!(sent["features"][0]["properties"], json!({}));
+    assert!(sent["resolution"].as_f64().expect("a resolution") > 0.0);
+    assert!(sent.get("t").is_none(), "the run pinned a time window");
+
+    // a second tick at the same moment leaves it alone: its interval has not
+    // run out
+    run_due(&app.state, now).await;
+    assert_eq!(stored_readings(&app, watch_id).await, 1);
+}
+
+#[tokio::test]
+async fn a_watch_runs_again_once_its_interval_has_run_out() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+    make_watch_oldest(&app, watch_id).await;
+
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+    assert_eq!(stored_readings(&app, watch_id).await, 1);
+
+    make_watch_due(&app, watch_id).await;
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+    assert_eq!(stored_readings(&app, watch_id).await, 2);
+}
+
+#[tokio::test]
+async fn a_refusing_geoplumb_lands_in_last_error_and_stores_no_reading() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+    make_watch_oldest(&app, watch_id).await;
+    stub.answer_with(503);
+
+    let now = time::OffsetDateTime::now_utc();
+    run_due(&app.state, now).await;
+
+    assert_eq!(stored_readings(&app, watch_id).await, 0);
+    let (last_run_at, last_error) = watch_run_state(&app, watch_id).await;
+    // the run is marked so the watch retries on its own interval and not on
+    // every tick
+    assert!(is_the_same_moment(last_run_at, now), "{last_run_at:?}");
+    assert!(
+        last_error.expect("a reason").contains("503"),
+        "the failure was not recorded"
+    );
+
+    // the next run clears it
+    stub.reduce_to(
+        json!({"id": 0, "count": 8, "mean": 0.5, "sum": 4.0, "minimum": 0.5, "maximum": 0.5}),
+    );
+    *stub.state.status.lock().expect("stub status") = None;
+    make_watch_due(&app, watch_id).await;
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+    let (_, last_error) = watch_run_state(&app, watch_id).await;
+    assert_eq!(last_error, None);
+    assert_eq!(stored_readings(&app, watch_id).await, 1);
+}
+
+#[tokio::test]
+async fn a_region_that_caught_no_pixels_records_a_failure_rather_than_a_reading() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+    make_watch_oldest(&app, watch_id).await;
+    // what geoplumb answers for a zone that caught nothing: a count and no
+    // statistics, since json has no NaN
+    stub.reduce_to(json!({
+        "id": 0, "count": 0, "sum": null, "minimum": null, "maximum": null, "mean": null
+    }));
+
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+    assert_eq!(stored_readings(&app, watch_id).await, 0);
+    let (_, last_error) = watch_run_state(&app, watch_id).await;
+    assert!(last_error.expect("a reason").contains("no pixels"));
+}
+
+#[tokio::test]
+async fn a_watch_keeps_only_its_newest_readings() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+    make_watch_oldest(&app, watch_id).await;
+
+    // fill the watch to its cap, oldest first, so the run below is one past it
+    sqlx::query(
+        "insert into watch_readings (watch_id, at, value, count)
+         select $1, now() - (step || ' seconds')::interval, 1.0, 1
+         from generate_series(1, $2) as step",
+    )
+    .bind(watch_id)
+    .bind(MAX_READINGS_PER_WATCH)
+    .execute(&app.state.pool)
+    .await
+    .expect("fill the watch");
+    assert_eq!(
+        stored_readings(&app, watch_id).await,
+        MAX_READINGS_PER_WATCH
+    );
+    let oldest: time::OffsetDateTime =
+        sqlx::query_scalar("select min(at) from watch_readings where watch_id = $1")
+            .bind(watch_id)
+            .fetch_one(&app.state.pool)
+            .await
+            .expect("the oldest reading");
+
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+
+    assert_eq!(
+        stored_readings(&app, watch_id).await,
+        MAX_READINGS_PER_WATCH,
+        "the cap did not hold"
+    );
+    let still_oldest: time::OffsetDateTime =
+        sqlx::query_scalar("select min(at) from watch_readings where watch_id = $1")
+            .bind(watch_id)
+            .fetch_one(&app.state.pool)
+            .await
+            .expect("the oldest reading");
+    assert!(
+        still_oldest > oldest,
+        "the oldest reading survived the insert past the cap"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_deletes_watch_readings_past_the_retention_window() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_body()).await;
+
+    sqlx::query(
+        "insert into watch_readings (watch_id, at, value, count)
+         values ($1, now() - ($2 || ' days')::interval, 1.0, 1), ($1, now(), 2.0, 2)",
+    )
+    .bind(watch_id)
+    .bind(READINGS_RETENTION_DAYS + 1)
+    .execute(&app.state.pool)
+    .await
+    .expect("store readings");
+    assert_eq!(stored_readings(&app, watch_id).await, 2);
+
+    agora_server::assets::sweep(&app.state.pool)
+        .await
+        .expect("sweep");
+    assert_eq!(stored_readings(&app, watch_id).await, 1);
 }

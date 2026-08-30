@@ -343,6 +343,25 @@ broken.
 Watches belong to the document rather than to whoever made one, so any editor
 can delete one, and deleting the document takes them with it.
 
+### Running a watch
+
+A scheduler ticks every 30 seconds, takes the watches whose interval has run
+out, oldest first, and runs up to 16 of them one at a time. Each one is a
+`POST {GEOPLUMB_URL}/zonal/{layer}` carrying the region as a one feature
+collection at 30 metre resolution and no `t`, which leaves geoplumb on the
+layer's own window. They run one at a time because geoplumb reduces four regions
+at once and answers the rest a 503.
+
+The reducer picks its own field out of the row that comes back, and that value
+and the pixel count are stored against the watch. Anything else, a refusal, a
+timeout, a body that is not a reduction, or a region that caught no pixels,
+lands in `lastError` instead and stores nothing. Either way the run is marked,
+so a watch geoplumb cannot answer retries on its own interval rather than on
+every tick, and the next reading clears the error.
+
+Readings are kept for 30 days, the same window a sensor reading gets, and a
+watch keeps its newest 10000 whatever the window says.
+
 ## Websocket
 
 `GET /ws?doc=<id>` and optionally `&since=<seq>`.
@@ -492,6 +511,8 @@ one is an `error` message or a 4xx, never a panic.
 | Layer name | 128 bytes of letters, digits, `-` and `_`, so it stays one url path segment |
 | Webhook url and secret | 2048 and 256 bytes |
 | Watch readings per list call | 500 |
+| Watch readings kept per watch | 10000, on top of the 30 day window |
+| Watches run per tick | 16, one at a time, every 30 seconds |
 
 Share link tokens are 128 random bits and attachment tokens 256, url safe.
 Session tokens expire after 12 hours and feed tokens after ten years, since a
@@ -510,8 +531,9 @@ immediately.
 
 ## Storage
 
-Attachment bytes sit in Postgres beside everything else, in `attachments`, and
-sensor readings in `readings`, keyed by feed, asset, kind and time.
+Attachment bytes sit in Postgres beside everything else, in `attachments`,
+sensor readings in `readings`, keyed by feed, asset, kind and time, and watch
+readings in `watch_readings`, keyed by watch and time.
 
 Ops are appended to `ops` and folded into `documents.checkpoint` every 256 ops
 after the last fold (`seq - checkpoint_seq`). The fold and the prune run in one

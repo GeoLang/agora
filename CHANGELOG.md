@@ -4,6 +4,15 @@
 
 ### Added
 
+- 2026-08-30: **watches run on a schedule**. A background task ticks every 30
+  seconds and runs the watches whose interval has run out, oldest first, up to
+  16 a tick and one at a time. A run is one `POST {GEOPLUMB_URL}/zonal/{layer}`
+  over the watch's region at 30 metre resolution, and the reducer's field out of
+  the row it answers is stored in `watch_readings` and relayed to the room.
+  Anything else lands in `lastError` and stores nothing, with the run still
+  marked so the watch retries on its own interval. Watch readings age out on the
+  30 day readings sweep, and a watch keeps its newest 10000.
+
 - 2026-08-30: **watches on the document socket**. A join now carries a
   `watches` frame after `assets`, holding every watch on the document with no
   webhook url and no webhook secret in it, so a share link guest sees what is

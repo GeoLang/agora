@@ -5,7 +5,7 @@ use agora_server::projects::{PTOLEMY_URL_ENV, ProjectAccess};
 use agora_server::watches::{GEOPLUMB_URL_ENV, Geoplumb};
 use agora_server::{
     AppState, DATABASE_URL_ENV, DEFAULT_PORT, PORT_ENV, assets, attachments, connect_pool, migrate,
-    router,
+    router, watches,
 };
 
 #[tokio::main]
@@ -58,6 +58,7 @@ async fn start() -> Result<(), String> {
         None => println!("{GEOPLUMB_URL_ENV} is not set: region watches are off"),
     }
     tokio::spawn(assets::mark_stale_periodically(Arc::clone(&state.rooms)));
+    tokio::spawn(watches::run_periodically(state.clone()));
 
     axum::serve(listener, router(state))
         .await

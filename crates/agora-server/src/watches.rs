@@ -11,16 +11,18 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::assets::rfc3339;
 use crate::auth::Caller;
 use crate::documents::{project_grant, require_editor, require_member};
 use crate::error::ApiError;
 use crate::limits::{
-    MAX_LAYER_NAME_BYTES, MAX_REGION_BYTES, MAX_REGION_POSITIONS, MAX_WATCH_READINGS_PAGE,
+    MAX_LAST_ERROR_CHARS, MAX_LAYER_NAME_BYTES, MAX_READINGS_PER_WATCH, MAX_REGION_BYTES,
+    MAX_REGION_POSITIONS, MAX_WATCH_READINGS_PAGE, MAX_WATCH_RUNS_PER_TICK,
     MAX_WEBHOOK_SECRET_BYTES, MAX_WEBHOOK_URL_BYTES, MIN_RING_POSITIONS,
-    MIN_WATCH_INTERVAL_SECONDS,
+    MIN_WATCH_INTERVAL_SECONDS, WATCH_TICK_SECONDS,
 };
 use crate::projects::read_capped_body;
-use crate::protocol::{Reducer, ThresholdOp, WatchState};
+use crate::protocol::{Reducer, ServerMessage, ThresholdOp, WatchState};
 use crate::state::valid_name;
 
 /// Env var holding geoplumb's base url. Unset turns region watches off: a
@@ -34,6 +36,20 @@ const GEOPLUMB_LAYERS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bytes of the layer listing read before it is refused. A layer is a handful
 /// of json fields and geoplumb serves a few of them.
 const MAX_LAYERS_BYTES: usize = 1024 * 1024;
+
+/// Ceiling on one reduction. Nobody is waiting on it, so it is far above the
+/// layer listing, and still well under geoplumb's own 240 second cap: past this
+/// the run is a failure agora records rather than a tick it sits inside.
+const GEOPLUMB_ZONAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bytes of a reduction read before it is refused. One region is one row.
+const MAX_ZONAL_BYTES: usize = 64 * 1024;
+
+/// Ground resolution a watch reduces at, web mercator metres. geoplumb refuses a
+/// request past 4096 squared pixels, which at this resolution is a region about
+/// 120 km across: a bigger one lands in `last_error` rather than being quietly
+/// answered about somewhere else.
+const WATCH_RESOLUTION_METRES: f64 = 30.0;
 
 /// Longitude and latitude bounds of a geojson position in degrees, RFC 7946.
 const LONGITUDE_LIMIT: f64 = 180.0;
@@ -111,6 +127,78 @@ impl Geoplumb {
             .filter_map(|entry| entry.get("name").and_then(Value::as_str))
             .any(|name| name == layer))
     }
+
+    /// Reduce one region over one layer. The `Err` is what the run records as
+    /// its `last_error`, so it says what went wrong in a line a person reads.
+    ///
+    /// No `t`, which leaves geoplumb on the layer's own window.
+    async fn zonal(&self, layer: &str, region: &Value) -> Result<ZonalRow, String> {
+        // the layer name passed valid_layer_name, so it is one path segment
+        let url = format!("{}/zonal/{layer}", self.base_url);
+        let body = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [{"type": "Feature", "geometry": region, "properties": {}}],
+            "resolution": WATCH_RESOLUTION_METRES,
+        });
+        let response = self
+            .client
+            .post(&url)
+            .timeout(GEOPLUMB_ZONAL_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| "geoplumb did not answer".to_string())?;
+        let status = response.status();
+        let Some(body) = read_capped_body(response, MAX_ZONAL_BYTES).await else {
+            return Err(format!("geoplumb answered {status} with an oversized body"));
+        };
+        if !status.is_success() {
+            let said = char_prefix(&String::from_utf8_lossy(&body), MAX_LAST_ERROR_CHARS);
+            return Err(format!("geoplumb answered {status}: {said}"));
+        }
+        let reduced: ZonalResponse = serde_json::from_slice(&body)
+            .map_err(|_| "geoplumb answered something that is not a reduction".to_string())?;
+        reduced
+            .rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| "geoplumb reduced no rows".to_string())
+    }
+}
+
+/// One zone's reduction as geoplumb answers it. Unknown keys are tolerated, the
+/// same way an ingest frame's are: geoplumb is versioned on its own and a field
+/// it adds must not stop every watch.
+#[derive(Debug, Deserialize)]
+struct ZonalRow {
+    count: i64,
+    sum: Option<f64>,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+    mean: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ZonalResponse {
+    rows: Vec<ZonalRow>,
+}
+
+/// The one number a watch keeps out of a reduction. `None` where the region
+/// caught no pixel, which has no mean, minimum, maximum or sum to record.
+fn reduced_value(reducer: Reducer, row: &ZonalRow) -> Option<f64> {
+    let value = match reducer {
+        Reducer::Mean => row.mean?,
+        Reducer::Min => row.minimum?,
+        Reducer::Max => row.maximum?,
+        Reducer::Sum => row.sum?,
+        // an empty region counts zero pixels, which is a number and not a gap
+        Reducer::Count => row.count as f64,
+    };
+    value.is_finite().then_some(value)
+}
+
+fn char_prefix(text: &str, cap: usize) -> String {
+    text.chars().take(cap).collect()
 }
 
 /// A layer name reaches geoplumb inside a url path, so the charset is what
@@ -499,6 +587,206 @@ pub async fn list_watch_readings(
     Ok(Json(readings))
 }
 
+/// One watch the scheduler is about to run.
+///
+/// No `Debug`: it carries the webhook secret.
+struct DueWatch {
+    id: Uuid,
+    document_id: Uuid,
+    layer: String,
+    region: Value,
+    reducer: Reducer,
+    threshold_op: Option<ThresholdOp>,
+    threshold_value: Option<f64>,
+}
+
+/// The watches whose interval has run out, oldest first.
+///
+/// A watch that has never run sorts by when it was made rather than ahead of
+/// everything, so a new watch does not jump the queue in front of one that has
+/// been waiting longer.
+async fn due_watches(pool: &PgPool, now: OffsetDateTime) -> Result<Vec<DueWatch>, sqlx::Error> {
+    let rows = sqlx::query(
+        "select id, doc_id, layer, region, reducer, threshold_op, threshold_value
+         from watches
+         where last_run_at is null
+            or last_run_at + interval_seconds * interval '1 second' <= $1
+         order by coalesce(last_run_at, created_at), id
+         limit $2",
+    )
+    .bind(now)
+    .bind(MAX_WATCH_RUNS_PER_TICK)
+    .fetch_all(pool)
+    .await?;
+
+    let mut due = Vec::with_capacity(rows.len());
+    for row in rows {
+        let reducer: String = row.try_get("reducer")?;
+        let threshold_op: Option<String> = row.try_get("threshold_op")?;
+        due.push(DueWatch {
+            id: row.try_get("id")?,
+            document_id: row.try_get("doc_id")?,
+            layer: row.try_get("layer")?,
+            region: row.try_get("region")?,
+            reducer: Reducer::parse(&reducer)
+                .ok_or_else(|| sqlx::Error::Decode("unknown reducer".into()))?,
+            threshold_op: threshold_op.as_deref().and_then(ThresholdOp::parse),
+            threshold_value: row.try_get("threshold_value")?,
+        });
+    }
+    Ok(due)
+}
+
+/// Whether this reading crosses the watch's line: it satisfies the threshold
+/// and the reading before it did not.
+///
+/// A watch with no threshold never trips, and a first reading past the line
+/// does, since there is no earlier reading holding it back.
+fn trips(watch: &DueWatch, value: f64, previous: Option<f64>) -> bool {
+    let (Some(op), Some(threshold)) = (watch.threshold_op, watch.threshold_value) else {
+        return false;
+    };
+    op.satisfied(value, threshold)
+        && !previous.is_some_and(|before| op.satisfied(before, threshold))
+}
+
+/// Store one reading, retire the oldest past the cap, and mark the watch run.
+/// Returns whether this reading tripped the watch.
+async fn store_reading(
+    pool: &PgPool,
+    watch: &DueWatch,
+    value: f64,
+    count: i64,
+    now: OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let previous: Option<f64> = sqlx::query_scalar(
+        "select value from watch_readings where watch_id = $1 order by at desc limit 1",
+    )
+    .bind(watch.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+
+    sqlx::query("insert into watch_readings (watch_id, at, value, count) values ($1, $2, $3, $4)")
+        .bind(watch.id)
+        .bind(now)
+        .bind(value)
+        .bind(count)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "delete from watch_readings
+         where watch_id = $1
+           and at < (select min(at) from
+                     (select at from watch_readings where watch_id = $1
+                      order by at desc limit $2) as kept)",
+    )
+    .bind(watch.id)
+    .bind(MAX_READINGS_PER_WATCH)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("update watches set last_run_at = $2, last_error = null where id = $1")
+        .bind(watch.id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    Ok(trips(watch, value, previous))
+}
+
+/// Record why a run produced no reading. `last_run_at` moves either way, so a
+/// watch geoplumb cannot answer for retries on its own interval rather than on
+/// every tick.
+async fn record_failure(
+    pool: &PgPool,
+    watch_id: Uuid,
+    now: OffsetDateTime,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("update watches set last_run_at = $2, last_error = $3 where id = $1")
+        .bind(watch_id)
+        .bind(now)
+        .bind(char_prefix(reason, MAX_LAST_ERROR_CHARS))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn run_one(state: &AppState, geoplumb: &Geoplumb, watch: &DueWatch, now: OffsetDateTime) {
+    let measured = match geoplumb.zonal(&watch.layer, &watch.region).await {
+        Ok(row) => match reduced_value(watch.reducer, &row) {
+            Some(value) => Ok((value, row.count)),
+            None => Err("the region caught no pixels".to_string()),
+        },
+        Err(reason) => Err(reason),
+    };
+
+    let (value, count) = match measured {
+        Ok(measured) => measured,
+        Err(reason) => {
+            if let Err(error) = record_failure(&state.pool, watch.id, now, &reason).await {
+                eprintln!("watch {} could not record its failure: {error}", watch.id);
+            }
+            return;
+        }
+    };
+
+    let tripped = match store_reading(&state.pool, watch, value, count, now).await {
+        Ok(tripped) => tripped,
+        Err(error) => {
+            // the run is left unmarked on purpose: the database is what failed,
+            // so the next tick tries the whole thing again
+            eprintln!("watch {} could not store its reading: {error}", watch.id);
+            return;
+        }
+    };
+
+    if let Some(room) = state.rooms.loaded(watch.document_id).await {
+        room.relay(&ServerMessage::WatchReading {
+            watch: watch.id,
+            at: rfc3339(now),
+            value,
+            count,
+            tripped,
+        });
+    }
+}
+
+/// Run every watch whose interval has run out, and return how many ran.
+///
+/// One at a time: geoplumb reduces four regions at once and answers the rest a
+/// 503, so asking for more than it serves would only fill `last_error`.
+///
+/// A plain function rather than something the timer owns, so a test drives one
+/// tick itself.
+pub async fn run_due(state: &AppState, now: OffsetDateTime) -> usize {
+    let Some(geoplumb) = state.geoplumb.as_deref() else {
+        return 0;
+    };
+    let due = match due_watches(&state.pool, now).await {
+        Ok(due) => due,
+        Err(error) => {
+            eprintln!("could not read the due watches: {error}");
+            return 0;
+        }
+    };
+    for watch in &due {
+        run_one(state, geoplumb, watch, now).await;
+    }
+    due.len()
+}
+
+/// Started by the binary and not by `router`, so a test drives one tick itself
+/// rather than racing this.
+pub async fn run_periodically(state: AppState) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(WATCH_TICK_SECONDS));
+    loop {
+        ticker.tick().await;
+        run_due(&state, OffsetDateTime::now_utc()).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -642,6 +930,74 @@ mod tests {
         for op in ["", "GT", ">", "ge", "eq"] {
             assert_eq!(ThresholdOp::parse(op), None, "{op:?}");
         }
+    }
+
+    fn row(count: i64, mean: Option<f64>) -> ZonalRow {
+        ZonalRow {
+            count,
+            sum: mean.map(|mean| mean * count as f64),
+            minimum: mean.map(|mean| mean - 0.1),
+            maximum: mean.map(|mean| mean + 0.1),
+            mean,
+        }
+    }
+
+    fn watching(threshold: Option<(ThresholdOp, f64)>) -> DueWatch {
+        DueWatch {
+            id: Uuid::new_v4(),
+            document_id: Uuid::new_v4(),
+            layer: "ndvi".to_string(),
+            region: square(),
+            reducer: Reducer::Mean,
+            threshold_op: threshold.map(|(op, _)| op),
+            threshold_value: threshold.map(|(_, value)| value),
+        }
+    }
+
+    #[test]
+    fn each_reducer_takes_its_own_field() {
+        let row = row(8, Some(0.5));
+        assert_eq!(reduced_value(Reducer::Mean, &row), Some(0.5));
+        assert_eq!(reduced_value(Reducer::Min, &row), Some(0.4));
+        assert_eq!(reduced_value(Reducer::Max, &row), Some(0.6));
+        assert_eq!(reduced_value(Reducer::Sum, &row), Some(4.0));
+        assert_eq!(reduced_value(Reducer::Count, &row), Some(8.0));
+    }
+
+    /// A region that caught nothing has a count and no statistics, since json
+    /// carries no NaN. Only `count` has an answer there.
+    #[test]
+    fn an_empty_region_reduces_to_a_count_and_nothing_else() {
+        let empty = row(0, None);
+        assert_eq!(reduced_value(Reducer::Count, &empty), Some(0.0));
+        for reducer in [Reducer::Mean, Reducer::Min, Reducer::Max, Reducer::Sum] {
+            assert_eq!(reduced_value(reducer, &empty), None, "{reducer:?}");
+        }
+    }
+
+    #[test]
+    fn a_watch_with_no_threshold_never_trips() {
+        let watch = watching(None);
+        assert!(!trips(&watch, 100.0, None));
+        assert!(!trips(&watch, 100.0, Some(0.0)));
+    }
+
+    #[test]
+    fn a_watch_trips_on_the_reading_that_crosses_and_not_again() {
+        let watch = watching(Some((ThresholdOp::Gt, 1.0)));
+        // the first reading past the line trips: nothing before it was under
+        assert!(trips(&watch, 2.0, None));
+        assert!(trips(&watch, 2.0, Some(0.5)));
+        // still over, so nothing crossed
+        assert!(!trips(&watch, 3.0, Some(2.0)));
+        // back under, then over again
+        assert!(!trips(&watch, 0.5, Some(2.0)));
+        assert!(trips(&watch, 2.0, Some(0.5)));
+
+        let watch = watching(Some((ThresholdOp::Lt, 1.0)));
+        assert!(trips(&watch, 0.5, None));
+        assert!(!trips(&watch, 0.4, Some(0.5)));
+        assert!(trips(&watch, 0.5, Some(2.0)));
     }
 
     #[test]

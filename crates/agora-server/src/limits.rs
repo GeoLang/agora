@@ -124,6 +124,17 @@ pub const MAX_READINGS_PER_WATCH: i64 = 10_000;
 /// Watch readings one list call returns.
 pub const MAX_WATCH_READINGS_PAGE: i64 = 500;
 
+/// How often the scheduler looks for watches whose interval has run out.
+pub const WATCH_TICK_SECONDS: u64 = 30;
+
+/// Watches one tick runs. They run one at a time, because geoplumb reduces four
+/// regions at once and answers the rest a 503, so this bounds how long a tick
+/// takes as well as how much work one asks for.
+pub const MAX_WATCH_RUNS_PER_TICK: i64 = 16;
+
+/// Characters of a failed run's reason kept on the watch.
+pub const MAX_LAST_ERROR_CHARS: usize = 200;
+
 /// How long a reading is kept.
 pub const READINGS_RETENTION_DAYS: i64 = 30;
 

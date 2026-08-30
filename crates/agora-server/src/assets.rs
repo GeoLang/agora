@@ -284,14 +284,21 @@ pub async fn mark_stale_periodically(rooms: Arc<RoomRegistry>) {
     }
 }
 
-/// Delete the readings past the retention window, and return how many went.
+/// Delete the readings past the retention window, sensor and watch alike, and
+/// return how many went.
 pub async fn sweep(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let cutoff = OffsetDateTime::now_utc() - Duration::days(READINGS_RETENTION_DAYS);
-    Ok(sqlx::query("delete from readings where at < $1")
+    let sensor = sqlx::query("delete from readings where at < $1")
         .bind(cutoff)
         .execute(pool)
         .await?
-        .rows_affected())
+        .rows_affected();
+    let watched = sqlx::query("delete from watch_readings where at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(sensor + watched)
 }
 
 pub async fn sweep_periodically(pool: PgPool) {
