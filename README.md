@@ -414,12 +414,21 @@ digits, `-`, `_` or `.`. Anything else is refused.
 {"type": "readings", "feed": "...", "readings": [{"asset": "TWIN-03", "kind": "temperature", "value": 21.5, "at": "2026-08-25T12:00:00Z"}]}
 {"type": "assets", "assets": [{"asset": "TWIN-03", "feed": "...", "online": true, "values": [{"kind": "temperature", "value": 21.5, "at": "2026-08-25T12:00:00Z"}]}]}
 {"type": "liveness", "asset": "TWIN-03", "online": false, "at": "2026-08-25T12:00:16Z"}
+{"type": "watches", "watches": [{"id": "...", "name": "reservoir", "layer": "ndvi", "region": {}, "reducer": "mean", "intervalSeconds": 3600, "thresholdOp": "lt", "thresholdValue": 0.4, "createdBy": "user-1", "createdAt": "2026-08-30T09:00:00Z", "lastRunAt": null, "lastError": null}]}
+{"type": "watchReading", "watch": "...", "at": "2026-08-30T12:00:00Z", "value": 0.31, "count": 4096, "tripped": true}
 {"type": "error", "reason": "edit role required"}
 ```
 
 `readings`, `assets` and `liveness` carry no `seq` and are not ops. They come
 from the feeds on the document, described under Feeds above, and `assets` holds
 the same JSON as `GET /documents/{id}/assets`.
+
+`watches` goes out on every join, after `assets`, and holds every watch on the
+document. It never carries `webhookUrl` or `webhookSecret`, so a share link
+guest on this socket sees what a watch measures and not where its alerts go.
+`watchReading` goes out on every watch run that produced a number, with
+`tripped` set on the run that crossed the watch's threshold. Neither is an op
+and neither carries a `seq`.
 
 `peers` goes out on every join and leave. A refused message is an `error` and the
 connection stays open, unless the credential itself is the problem, which is a

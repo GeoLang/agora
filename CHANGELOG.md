@@ -4,6 +4,12 @@
 
 ### Added
 
+- 2026-08-30: **watches on the document socket**. A join now carries a
+  `watches` frame after `assets`, holding every watch on the document with no
+  webhook url and no webhook secret in it, so a share link guest sees what is
+  watched and not where its alerts go. A run relays
+  `watchReading {watch, at, value, count, tripped}` to everyone looking.
+
 - 2026-08-30: **region watches, stored and routed**. A document can hold watches
   over a region (`POST /documents/{id}/watches`, migration 009): a GeoJSON
   Polygon or MultiPolygon, one geoplumb layer, a reducer, an interval of at

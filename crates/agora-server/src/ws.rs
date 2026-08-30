@@ -25,6 +25,7 @@ use crate::links::live_link;
 use crate::protocol::{ClientMessage, Peer, ServerMessage};
 use crate::role::DocumentRole;
 use crate::room::{JoinError, Room, RoomEvent, oldest_retained_op, ops_between};
+use crate::watches::watch_states;
 
 /// Display name for anyone who arrived through a share link. They have no
 /// platform identity, so there is no name to show beyond this.
@@ -208,10 +209,11 @@ async fn close_with(mut socket: WebSocket, reason: &str) {
 
 /// What a client is sent before the live stream starts: either the whole state
 /// or the ops it missed, when the retained tail still reaches back that far,
-/// and then what every asset on the document is reporting.
+/// then what every asset on the document is reporting and what every watch on
+/// it is watching.
 ///
-/// The asset frame goes out on every join, a resume that missed nothing
-/// included, because asset state is not carried by ops and so cannot be
+/// The asset and watch frames go out on every join, a resume that missed
+/// nothing included, because neither is carried by ops and so neither can be
 /// replayed from the tail.
 async fn opening_messages(
     pool: &PgPool,
@@ -223,6 +225,7 @@ async fn opening_messages(
 ) -> Vec<ServerMessage> {
     let mut opening = document_messages(pool, document_id, since, seq, state, identity).await;
     opening.push(assets_message(pool, document_id).await);
+    opening.push(watches_message(pool, document_id).await);
     opening
 }
 
@@ -263,6 +266,14 @@ async fn assets_message(pool: &PgPool, document_id: Uuid) -> ServerMessage {
         .await
         .unwrap_or_default();
     ServerMessage::Assets { assets }
+}
+
+/// A database failure sends an empty list, for the reason the asset frame does.
+/// The frame carries no webhook, so a share link guest sees the same watches
+/// every member does.
+async fn watches_message(pool: &PgPool, document_id: Uuid) -> ServerMessage {
+    let watches = watch_states(pool, document_id).await.unwrap_or_default();
+    ServerMessage::Watches { watches }
 }
 
 fn snapshot_message(seq: i64, state: serde_json::Value, identity: &Identity) -> ServerMessage {

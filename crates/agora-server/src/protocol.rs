@@ -296,6 +296,20 @@ pub enum ServerMessage {
     Assets {
         assets: Vec<AssetState>,
     },
+    /// Every region watch on the document, sent on join.
+    Watches {
+        watches: Vec<WatchState>,
+    },
+    /// What a watch just measured. `tripped` is set on the run that crossed the
+    /// watch's threshold, which is the run that notified its members.
+    #[serde(rename = "watchReading")]
+    WatchReading {
+        watch: Uuid,
+        at: String,
+        value: f64,
+        count: i64,
+        tripped: bool,
+    },
     /// An asset started or stopped reporting.
     Liveness {
         asset: String,
@@ -666,6 +680,70 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&FeedReply::error("malformed message").encode()).unwrap(),
             json!({"type": "error", "reason": "malformed message"})
+        );
+    }
+
+    #[test]
+    fn the_watch_frames_match_the_pinned_wire_shape() {
+        let watch = Uuid::new_v4();
+        let region = json!({
+            "type": "Polygon",
+            "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]
+        });
+        let watches = ServerMessage::Watches {
+            watches: vec![WatchState {
+                id: watch,
+                name: "reservoir".to_string(),
+                layer: "ndvi".to_string(),
+                region: region.clone(),
+                reducer: Reducer::Mean,
+                interval_seconds: 3600,
+                threshold_op: Some(ThresholdOp::Lt),
+                threshold_value: Some(0.4),
+                created_by: "user-1".to_string(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                last_run_at: None,
+                last_error: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&watches.encode()).unwrap(),
+            json!({
+                "type": "watches",
+                "watches": [{
+                    "id": watch,
+                    "name": "reservoir",
+                    "layer": "ndvi",
+                    "region": region,
+                    "reducer": "mean",
+                    "intervalSeconds": 3600,
+                    "thresholdOp": "lt",
+                    "thresholdValue": 0.4,
+                    "createdBy": "user-1",
+                    "createdAt": "1970-01-01T00:00:00Z",
+                    "lastRunAt": null,
+                    "lastError": null
+                }]
+            })
+        );
+
+        let reading = ServerMessage::WatchReading {
+            watch,
+            at: "2026-08-30T12:00:00Z".to_string(),
+            value: 0.31,
+            count: 4096,
+            tripped: true,
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&reading.encode()).unwrap(),
+            json!({
+                "type": "watchReading",
+                "watch": watch,
+                "at": "2026-08-30T12:00:00Z",
+                "value": 0.31,
+                "count": 4096,
+                "tripped": true
+            })
         );
     }
 

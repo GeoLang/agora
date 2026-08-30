@@ -471,10 +471,12 @@ async fn expect_op_with_seq(client: &mut WebsocketClient, seq: i64) -> Value {
     panic!("op {seq} never arrived")
 }
 
-/// The whole join sequence: a snapshot, the assets, then the peer list.
+/// The whole join sequence: a snapshot, the assets, the watches, then the peer
+/// list.
 async fn expect_join(client: &mut WebsocketClient) -> (Value, Value) {
     let snapshot = client.expect_message("snapshot").await;
     client.expect_message("assets").await;
+    client.expect_message("watches").await;
     let peers = client.expect_message("peers").await;
     (snapshot, peers)
 }
@@ -525,7 +527,7 @@ async fn apply_ops_directly_from(
 }
 
 #[tokio::test]
-async fn a_join_receives_a_snapshot_the_assets_then_the_peer_list() {
+async fn a_join_receives_a_snapshot_the_assets_the_watches_then_the_peer_list() {
     let app = spawn_app().await;
     let owner = fresh_user();
     let token = platform_token(&owner);
@@ -547,6 +549,12 @@ async fn a_join_receives_a_snapshot_the_assets_then_the_peer_list() {
         assets["assets"].as_array().expect("an asset array").len(),
         0,
         "a document with no feeds reported assets"
+    );
+    let watches = client.expect_message("watches").await;
+    assert_eq!(
+        watches["watches"].as_array().expect("a watch array").len(),
+        0,
+        "a document with no watches reported one"
     );
 
     let peers = client.expect_message("peers").await;
@@ -837,6 +845,7 @@ async fn a_view_role_op_is_refused_and_the_connection_stays_open() {
     let snapshot = reader_client.expect_message("snapshot").await;
     assert_eq!(snapshot["role"], "view", "a reader was not told its role");
     reader_client.expect_message("assets").await;
+    reader_client.expect_message("watches").await;
     reader_client.expect_message("peers").await;
 
     let reason = send_and_refuse(
@@ -952,6 +961,7 @@ async fn a_reconnect_with_since_replays_only_the_missed_ops() {
     let second = reconnected.expect_message("op").await;
     assert_eq!(second["seq"], 3);
     reconnected.expect_message("assets").await;
+    reconnected.expect_message("watches").await;
     reconnected.expect_message("peers").await;
     assert!(
         reconnected.try_next_message().await.is_none(),
@@ -960,6 +970,7 @@ async fn a_reconnect_with_since_replays_only_the_missed_ops() {
 
     let mut caught_up = open(&app, document_id, &token, Some(3)).await;
     caught_up.expect_message("assets").await;
+    caught_up.expect_message("watches").await;
     let peers = caught_up.expect_message("peers").await;
     assert!(peers["peers"].is_array(), "a caught up client got a replay");
 }
@@ -1015,6 +1026,7 @@ async fn a_reconnect_replays_a_batch_as_the_one_frame_it_was_applied_in() {
     assert_eq!(last["seq"], 4);
     assert_eq!(last["key"], "layers/last");
     reconnected.expect_message("assets").await;
+    reconnected.expect_message("watches").await;
     reconnected.expect_message("peers").await;
     assert!(
         reconnected.try_next_message().await.is_none(),
@@ -1055,6 +1067,7 @@ async fn a_since_older_than_the_retained_tail_falls_back_to_a_snapshot() {
     assert_eq!(snapshot["seq"], 3);
     assert_eq!(snapshot["state"]["layers"]["l1"]["order"], "a0");
     reconnected.expect_message("assets").await;
+    reconnected.expect_message("watches").await;
     reconnected.expect_message("peers").await;
 }
 
@@ -4850,6 +4863,7 @@ async fn a_join_after_readings_gets_the_assets_before_the_peers() {
     let mut client = open(&app, document_id, &token, None).await;
     client.expect_message("snapshot").await;
     let assets = client.expect_message("assets").await;
+    client.expect_message("watches").await;
     let asset = only_asset(&assets);
     assert_eq!(asset["asset"], "TWIN-03");
     assert_eq!(asset["feed"], feed_id.to_string());
@@ -4939,6 +4953,7 @@ async fn a_room_that_loads_after_an_asset_went_quiet_starts_it_offline() {
     let mut client = open(&app, document_id, &token, None).await;
     client.expect_message("snapshot").await;
     let assets = client.expect_message("assets").await;
+    client.expect_message("watches").await;
     assert_eq!(only_asset(&assets)["online"], false);
     client.expect_message("peers").await;
 
@@ -5683,5 +5698,36 @@ async fn a_session_token_reaches_no_watch_route() {
             .await
             .status(),
         baseline
+    );
+}
+
+#[tokio::test]
+async fn a_join_carries_the_documents_watches_and_never_their_webhooks() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let mut body = watch_body();
+    body["webhookUrl"] = json!("https://hooks.example.test/basin");
+    body["webhookSecret"] = json!("a shared signing secret");
+    let watch_id = created_watch(&app, &owner_token, document_id, &body).await;
+    let guest_token = guest_session(&app, &owner_token, document_id, "view").await;
+
+    let mut guest = open(&app, document_id, &guest_token, None).await;
+    guest.expect_message("snapshot").await;
+    guest.expect_message("assets").await;
+    let frame = guest.expect_message("watches").await;
+
+    let watches = frame["watches"].as_array().expect("a watch array");
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0]["id"], watch_id.to_string());
+    assert_eq!(watches[0]["name"], "reservoir");
+    assert_eq!(watches[0]["layer"], STUB_LAYER);
+    assert_eq!(watches[0]["reducer"], "mean");
+    assert_eq!(watches[0]["region"], region());
+    let rendered = frame.to_string();
+    assert!(
+        !rendered.contains("webhook") && !rendered.contains("signing secret"),
+        "the watches frame carried a webhook: {rendered}"
     );
 }
