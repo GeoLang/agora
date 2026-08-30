@@ -9,13 +9,14 @@ use agora_server::limits::{
     MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_FEED_READINGS_PER_FRAME,
     MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT,
     MAX_PRESENCE_BYTES, MAX_READINGS_PER_WATCH, MAX_REGION_POSITIONS, MAX_USER_ID_BYTES,
-    MAX_WATCH_READINGS_PAGE, MIN_WATCH_INTERVAL_SECONDS, READINGS_RETENTION_DAYS,
+    MAX_WATCH_READINGS_PAGE, MIN_WATCH_INTERVAL_SECONDS, READINGS_RETENTION_DAYS, WEBHOOK_ATTEMPTS,
 };
 use agora_server::projects::ProjectAccess;
 use agora_server::protocol::{BatchOp, OpValue, Peer};
 use agora_server::role::DocumentRole;
 use agora_server::state::META_NAME_KEY;
 use agora_server::watches::{Geoplumb, run_due};
+use agora_server::webhooks::{PrivateHosts, Webhooks};
 use agora_server::{AppState, migrate, router};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -5310,7 +5311,26 @@ async fn stored_readings(app: &TestApp, watch_id: Uuid) -> i64 {
         .expect("count the readings")
 }
 
+/// The wait before a retried delivery. Milliseconds, so the attempts a test
+/// counts do not cost it seconds.
+const TEST_WEBHOOK_BACKOFF: Duration = Duration::from_millis(5);
+
+/// Every webhook receiver in this suite is a loopback port, which is what the
+/// binary refuses, so the tests are the one caller that reaches one.
 async fn spawn_app_with_geoplumb(stub: &GeoplumbStub) -> TestApp {
+    let auth = AuthConfig::new(TEST_SECRET).expect("test secret is long enough");
+    let geoplumb = Geoplumb::new(&stub.base_url).expect("the stub url is usable");
+    serve(
+        AppState::new(test_pool().await, auth)
+            .with_geoplumb(geoplumb)
+            .with_webhooks(Webhooks::new(TEST_WEBHOOK_BACKOFF, PrivateHosts::Allowed)),
+    )
+    .await
+}
+
+/// The same app the binary runs: a webhook naming the platform's own network
+/// is refused.
+async fn spawn_app_refusing_private_webhooks(stub: &GeoplumbStub) -> TestApp {
     let auth = AuthConfig::new(TEST_SECRET).expect("test secret is long enough");
     let geoplumb = Geoplumb::new(&stub.base_url).expect("the stub url is usable");
     serve(AppState::new(test_pool().await, auth).with_geoplumb(geoplumb)).await
@@ -6064,4 +6084,345 @@ async fn the_sweep_deletes_watch_readings_past_the_retention_window() {
         .await
         .expect("sweep");
     assert_eq!(stored_readings(&app, watch_id).await, 1);
+}
+
+/// One webhook post as the receiver saw it.
+#[derive(Clone)]
+struct Delivered {
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct ReceiverState {
+    delivered: Arc<Mutex<Vec<Delivered>>>,
+    status: Arc<Mutex<u16>>,
+}
+
+/// A webhook receiver, and what it was sent.
+struct Receiver {
+    url: String,
+    state: ReceiverState,
+}
+
+async fn receive_hook(
+    axum::extract::State(state): axum::extract::State<ReceiverState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::http::StatusCode {
+    let headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_lowercase(), value.to_string()))
+        })
+        .collect();
+    state.delivered.lock().expect("delivered").push(Delivered {
+        headers,
+        body: body.to_vec(),
+    });
+    axum::http::StatusCode::from_u16(*state.status.lock().expect("receiver status"))
+        .expect("a status code")
+}
+
+async fn spawn_receiver() -> Receiver {
+    let state = ReceiverState {
+        delivered: Arc::new(Mutex::new(Vec::new())),
+        status: Arc::new(Mutex::new(204)),
+    };
+    let router = axum::Router::new()
+        .route("/hook", axum::routing::post(receive_hook))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the receiver");
+    let address = listener.local_addr().expect("receiver address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Receiver {
+        url: format!("http://{address}/hook"),
+        state,
+    }
+}
+
+impl Receiver {
+    fn answer_with(&self, status: u16) {
+        *self.state.status.lock().expect("receiver status") = status;
+    }
+
+    fn delivered(&self) -> Vec<Delivered> {
+        self.state.delivered.lock().expect("delivered").clone()
+    }
+}
+
+/// A watch over a threshold, which is what a trip needs.
+fn watch_over(threshold: f64) -> Value {
+    let mut body = watch_body();
+    body["thresholdOp"] = json!("gt");
+    body["thresholdValue"] = json!(threshold);
+    body
+}
+
+fn reduction(mean: f64) -> Value {
+    json!({"id": 0, "count": 16, "sum": mean * 16.0, "minimum": mean, "maximum": mean, "mean": mean})
+}
+
+/// Run the watch once over this reading.
+async fn run_reading(app: &TestApp, stub: &GeoplumbStub, watch_id: Uuid, mean: f64) {
+    stub.reduce_to(reduction(mean));
+    make_watch_due(app, watch_id).await;
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+}
+
+/// How many times this watch has told the document's members it tripped.
+async fn trip_notifications(app: &TestApp, watch_id: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from notifications where watch_id = $1")
+        .bind(watch_id)
+        .fetch_one(&app.state.pool)
+        .await
+        .expect("count the notifications")
+}
+
+#[tokio::test]
+async fn a_watch_trips_when_it_crosses_and_not_again_while_it_stays_over() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_over(1.0)).await;
+    make_watch_oldest(&app, watch_id).await;
+
+    // under the line, so nothing to say
+    stub.reduce_to(reduction(0.5));
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+    assert_eq!(trip_notifications(&app, watch_id).await, 0);
+
+    // over it, which is the crossing
+    run_reading(&app, &stub, watch_id, 2.0).await;
+    assert_eq!(trip_notifications(&app, watch_id).await, 1);
+
+    // still over, so nothing crossed
+    run_reading(&app, &stub, watch_id, 3.0).await;
+    assert_eq!(trip_notifications(&app, watch_id).await, 1);
+
+    // back under, and over again, which is a second crossing
+    run_reading(&app, &stub, watch_id, 0.5).await;
+    assert_eq!(trip_notifications(&app, watch_id).await, 1);
+    run_reading(&app, &stub, watch_id, 2.5).await;
+    assert_eq!(trip_notifications(&app, watch_id).await, 2);
+
+    assert_eq!(stored_readings(&app, watch_id).await, 5);
+}
+
+#[tokio::test]
+async fn a_trip_notifies_every_member_and_lists_cleanly() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "basin").await;
+    let viewer = fresh_user();
+    set_member(&app, &owner_token, document_id, &viewer, "view").await;
+    let viewer_token = platform_token(&viewer);
+    let stranger_token = platform_token(&fresh_user());
+    let watch_id = created_watch(&app, &owner_token, document_id, &watch_over(1.0)).await;
+    make_watch_oldest(&app, watch_id).await;
+
+    stub.reduce_to(reduction(2.0));
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+
+    for token in [&owner_token, &viewer_token] {
+        let listed = list_notifications(&app, token).await;
+        let listed = listed.as_array().expect("an array");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0]["watchId"], watch_id.to_string());
+        assert_eq!(listed[0]["commentId"], Value::Null);
+        assert_eq!(listed[0]["authorName"], "reservoir");
+        assert_eq!(listed[0]["docName"], "basin");
+        assert_eq!(listed[0]["excerpt"], "reservoir: mean 2 gt 1");
+        assert_eq!(listed[0]["readAt"], Value::Null);
+    }
+    assert!(
+        list_notifications(&app, &stranger_token)
+            .await
+            .as_array()
+            .expect("an array")
+            .is_empty(),
+        "a stranger was notified"
+    );
+
+    // and deleting the watch takes them with it
+    assert_eq!(
+        delete_watch(&app, &owner_token, document_id, watch_id)
+            .await
+            .status(),
+        204
+    );
+    assert!(
+        list_notifications(&app, &owner_token)
+            .await
+            .as_array()
+            .expect("an array")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_trip_posts_a_signed_webhook() {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let receiver = spawn_receiver().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    let secret = "a shared signing secret";
+    let mut body = watch_over(1.0);
+    body["webhookUrl"] = json!(receiver.url);
+    body["webhookSecret"] = json!(secret);
+    let watch_id = created_watch(&app, &owner_token, document_id, &body).await;
+    make_watch_oldest(&app, watch_id).await;
+
+    stub.reduce_to(reduction(2.0));
+    let now = time::OffsetDateTime::now_utc();
+    run_due(&app.state, now).await;
+
+    let delivered = receiver.delivered();
+    assert_eq!(delivered.len(), 1);
+    let posted = &delivered[0];
+    assert_eq!(
+        posted.headers.get("x-agora-event").map(String::as_str),
+        Some("watch.tripped")
+    );
+    assert!(
+        Uuid::parse_str(
+            posted
+                .headers
+                .get("x-agora-delivery")
+                .expect("a delivery id")
+        )
+        .is_ok(),
+        "the delivery id is not a uuid"
+    );
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("any key length");
+    mac.update(&posted.body);
+    let expected = format!("sha256={}", hex_of(&mac.finalize().into_bytes()));
+    assert_eq!(
+        posted.headers.get("x-agora-signature").map(String::as_str),
+        Some(expected.as_str()),
+        "the signature does not cover the body that arrived"
+    );
+
+    let event: Value = serde_json::from_slice(&posted.body).expect("json body");
+    assert_eq!(event["event"], "watch.tripped");
+    assert!(
+        time::OffsetDateTime::parse(
+            event["occurredAt"].as_str().expect("a time"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok()
+    );
+    assert_eq!(event["data"]["watchId"], watch_id.to_string());
+    assert_eq!(event["data"]["documentId"], document_id.to_string());
+    assert_eq!(event["data"]["name"], "reservoir");
+    assert_eq!(event["data"]["layer"], STUB_LAYER);
+    assert_eq!(event["data"]["reducer"], "mean");
+    assert_eq!(event["data"]["value"], 2.0);
+    assert_eq!(event["data"]["count"], 16);
+    assert!(event["data"]["at"].as_str().is_some());
+
+    let (_, last_error) = watch_run_state(&app, watch_id).await;
+    assert_eq!(last_error, None, "a delivered webhook left an error");
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[tokio::test]
+async fn a_webhook_that_refuses_is_retried_and_leaves_the_reading_alone() {
+    let _background = background_lock().await;
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_with_geoplumb(&stub).await;
+    let receiver = spawn_receiver().await;
+    receiver.answer_with(500);
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    let mut body = watch_over(1.0);
+    body["webhookUrl"] = json!(receiver.url);
+    let watch_id = created_watch(&app, &owner_token, document_id, &body).await;
+    make_watch_oldest(&app, watch_id).await;
+
+    stub.reduce_to(reduction(2.0));
+    run_due(&app.state, time::OffsetDateTime::now_utc()).await;
+
+    assert_eq!(
+        receiver.delivered().len(),
+        WEBHOOK_ATTEMPTS as usize,
+        "the delivery was not retried"
+    );
+    // an unsigned webhook carries no signature at all
+    assert!(
+        !receiver.delivered()[0]
+            .headers
+            .contains_key("x-agora-signature")
+    );
+
+    let (last_run_at, last_error) = watch_run_state(&app, watch_id).await;
+    assert!(last_run_at.is_some());
+    assert!(
+        last_error.expect("a reason").contains("500"),
+        "the failed delivery was not recorded"
+    );
+    // the reading and the notification stand: only the alert did not arrive
+    assert_eq!(stored_readings(&app, watch_id).await, 1);
+    assert_eq!(trip_notifications(&app, watch_id).await, 1);
+}
+
+#[tokio::test]
+async fn a_webhook_pointing_inside_the_platform_is_refused_at_create() {
+    let stub = spawn_geoplumb_stub().await;
+    let app = spawn_app_refusing_private_webhooks(&stub).await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "basin").await;
+
+    for url in [
+        "http://127.0.0.1:9000/hook",
+        "http://localhost:9000/hook",
+        "http://[::1]:9000/hook",
+        "http://10.0.0.7/hook",
+        "http://169.254.169.254/latest/meta-data/",
+    ] {
+        let mut body = watch_body();
+        body["webhookUrl"] = json!(url);
+        assert_eq!(
+            create_watch(&app, &owner_token, document_id, &body)
+                .await
+                .status(),
+            400,
+            "{url} was accepted"
+        );
+    }
+
+    // a name nothing answers for is taken, and refused when the delivery is
+    // tried instead
+    let mut body = watch_body();
+    body["webhookUrl"] = json!("https://hooks.example.test/basin");
+    assert_eq!(
+        create_watch(&app, &owner_token, document_id, &body)
+            .await
+            .status(),
+        201
+    );
 }

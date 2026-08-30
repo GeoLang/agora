@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgConnection, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -105,13 +105,54 @@ pub async fn record_comment_mentions(
     Ok(())
 }
 
+/// Tell everyone on the document that a watch crossed its threshold.
+///
+/// One row per current member, the acting user included: nobody acted, the
+/// watch did. `author_name` is the watch's name, so a listing reads the way a
+/// mention does without a client having to know which kind it is holding.
+pub async fn record_watch_trip(
+    pool: &PgPool,
+    document_id: Uuid,
+    watch_id: Uuid,
+    watch_name: &str,
+    excerpt: &str,
+) -> Result<u64, sqlx::Error> {
+    let recipients: Vec<String> =
+        sqlx::query_scalar("select user_id from members where doc_id = $1")
+            .bind(document_id)
+            .fetch_all(pool)
+            .await?;
+    if recipients.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<Uuid> = recipients.iter().map(|_| Uuid::new_v4()).collect();
+    let written = sqlx::query(
+        "insert into notifications (id, user_id, doc_id, watch_id, author_name, excerpt)
+         select id, user_id, $3, $4, $5, $6
+         from unnest($1::uuid[], $2::text[]) as recipient (id, user_id)",
+    )
+    .bind(&ids)
+    .bind(&recipients)
+    .bind(document_id)
+    .bind(watch_id)
+    .bind(char_prefix(watch_name, NOTIFICATION_EXCERPT_CHARS))
+    .bind(char_prefix(excerpt, NOTIFICATION_EXCERPT_CHARS))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(written)
+}
+
+/// One notification, from a mention or from a watch. Exactly one of
+/// `commentId` and `watchId` names what it is about.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationEntry {
     id: Uuid,
     doc_id: Uuid,
     doc_name: String,
-    comment_id: String,
+    comment_id: Option<String>,
+    watch_id: Option<Uuid>,
     author_name: String,
     excerpt: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -125,7 +166,7 @@ pub async fn list_notifications(
     caller: Caller,
 ) -> Result<Json<Vec<NotificationEntry>>, ApiError> {
     let rows = sqlx::query(
-        "select n.id, n.doc_id, d.name as doc_name, n.comment_id, n.author_name,
+        "select n.id, n.doc_id, d.name as doc_name, n.comment_id, n.watch_id, n.author_name,
                 n.excerpt, n.created_at, n.read_at
          from notifications n join documents d on d.id = n.doc_id
          where n.user_id = $1
@@ -143,6 +184,7 @@ pub async fn list_notifications(
             doc_id: row.try_get("doc_id")?,
             doc_name: row.try_get("doc_name")?,
             comment_id: row.try_get("comment_id")?,
+            watch_id: row.try_get("watch_id")?,
             author_name: row.try_get("author_name")?,
             excerpt: row.try_get("excerpt")?,
             created_at: row.try_get("created_at")?,

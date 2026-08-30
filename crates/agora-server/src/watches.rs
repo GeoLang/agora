@@ -21,9 +21,11 @@ use crate::limits::{
     MAX_WEBHOOK_SECRET_BYTES, MAX_WEBHOOK_URL_BYTES, MIN_RING_POSITIONS,
     MIN_WATCH_INTERVAL_SECONDS, WATCH_TICK_SECONDS,
 };
+use crate::notifications::record_watch_trip;
 use crate::projects::read_capped_body;
 use crate::protocol::{Reducer, ServerMessage, ThresholdOp, WatchState};
 use crate::state::valid_name;
+use crate::webhooks::WATCH_TRIPPED_EVENT;
 
 /// Env var holding geoplumb's base url. Unset turns region watches off: a
 /// create is refused and nothing is scheduled.
@@ -429,7 +431,12 @@ pub async fn create_watch(
         ));
     }
     if let Some(url) = request.webhook_url.as_deref() {
-        valid_webhook_url(url).map_err(ApiError::bad_request)?;
+        let url = valid_webhook_url(url).map_err(ApiError::bad_request)?;
+        state
+            .webhooks
+            .is_worth_registering(&url)
+            .await
+            .map_err(ApiError::bad_request)?;
     }
     if request
         .webhook_secret
@@ -593,11 +600,14 @@ pub async fn list_watch_readings(
 struct DueWatch {
     id: Uuid,
     document_id: Uuid,
+    name: String,
     layer: String,
     region: Value,
     reducer: Reducer,
     threshold_op: Option<ThresholdOp>,
     threshold_value: Option<f64>,
+    webhook_url: Option<String>,
+    webhook_secret: Option<String>,
 }
 
 /// The watches whose interval has run out, oldest first.
@@ -607,7 +617,8 @@ struct DueWatch {
 /// been waiting longer.
 async fn due_watches(pool: &PgPool, now: OffsetDateTime) -> Result<Vec<DueWatch>, sqlx::Error> {
     let rows = sqlx::query(
-        "select id, doc_id, layer, region, reducer, threshold_op, threshold_value
+        "select id, doc_id, name, layer, region, reducer, threshold_op, threshold_value,
+                webhook_url, webhook_secret
          from watches
          where last_run_at is null
             or last_run_at + interval_seconds * interval '1 second' <= $1
@@ -626,12 +637,15 @@ async fn due_watches(pool: &PgPool, now: OffsetDateTime) -> Result<Vec<DueWatch>
         due.push(DueWatch {
             id: row.try_get("id")?,
             document_id: row.try_get("doc_id")?,
+            name: row.try_get("name")?,
             layer: row.try_get("layer")?,
             region: row.try_get("region")?,
             reducer: Reducer::parse(&reducer)
                 .ok_or_else(|| sqlx::Error::Decode("unknown reducer".into()))?,
             threshold_op: threshold_op.as_deref().and_then(ThresholdOp::parse),
             threshold_value: row.try_get("threshold_value")?,
+            webhook_url: row.try_get("webhook_url")?,
+            webhook_secret: row.try_get("webhook_secret")?,
         });
     }
     Ok(due)
@@ -698,7 +712,7 @@ async fn store_reading(
 /// Record why a run produced no reading. `last_run_at` moves either way, so a
 /// watch geoplumb cannot answer for retries on its own interval rather than on
 /// every tick.
-async fn record_failure(
+async fn record_failed_run(
     pool: &PgPool,
     watch_id: Uuid,
     now: OffsetDateTime,
@@ -713,6 +727,77 @@ async fn record_failure(
     Ok(())
 }
 
+/// Record an alert that did not arrive. The reading and the run stand: only the
+/// delivery failed.
+async fn record_delivery_failure(
+    pool: &PgPool,
+    watch_id: Uuid,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("update watches set last_error = $2 where id = $1")
+        .bind(watch_id)
+        .bind(char_prefix(reason, MAX_LAST_ERROR_CHARS))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// What a trip says, in the one line a notification and a webhook both carry.
+fn trip_excerpt(watch: &DueWatch, value: f64) -> String {
+    let mut said = format!("{}: {} {value}", watch.name, watch.reducer.as_str());
+    if let (Some(op), Some(threshold)) = (watch.threshold_op, watch.threshold_value) {
+        said.push_str(&format!(" {} {threshold}", op.as_str()));
+    }
+    said
+}
+
+/// Tell the document's members, and the watch's webhook when it has one.
+///
+/// The notification is written first: a webhook that never answers must not
+/// cost the people on the document their alert.
+async fn alert(state: &AppState, watch: &DueWatch, value: f64, count: i64, at: OffsetDateTime) {
+    if let Err(error) = record_watch_trip(
+        &state.pool,
+        watch.document_id,
+        watch.id,
+        &watch.name,
+        &trip_excerpt(watch, value),
+    )
+    .await
+    {
+        eprintln!("watch {} could not notify its members: {error}", watch.id);
+    }
+
+    let Some(url) = watch.webhook_url.as_deref() else {
+        return;
+    };
+    let data = serde_json::json!({
+        "watchId": watch.id,
+        "documentId": watch.document_id,
+        "name": watch.name,
+        "layer": watch.layer,
+        "reducer": watch.reducer.as_str(),
+        "value": value,
+        "count": count,
+        "at": rfc3339(at),
+    });
+    let delivered = state
+        .webhooks
+        .deliver(
+            url,
+            watch.webhook_secret.as_deref(),
+            WATCH_TRIPPED_EVENT,
+            at,
+            data,
+        )
+        .await;
+    if let Err(reason) = delivered
+        && let Err(error) = record_delivery_failure(&state.pool, watch.id, &reason).await
+    {
+        eprintln!("watch {} could not record its delivery: {error}", watch.id);
+    }
+}
+
 async fn run_one(state: &AppState, geoplumb: &Geoplumb, watch: &DueWatch, now: OffsetDateTime) {
     let measured = match geoplumb.zonal(&watch.layer, &watch.region).await {
         Ok(row) => match reduced_value(watch.reducer, &row) {
@@ -725,7 +810,7 @@ async fn run_one(state: &AppState, geoplumb: &Geoplumb, watch: &DueWatch, now: O
     let (value, count) = match measured {
         Ok(measured) => measured,
         Err(reason) => {
-            if let Err(error) = record_failure(&state.pool, watch.id, now, &reason).await {
+            if let Err(error) = record_failed_run(&state.pool, watch.id, now, &reason).await {
                 eprintln!("watch {} could not record its failure: {error}", watch.id);
             }
             return;
@@ -750,6 +835,9 @@ async fn run_one(state: &AppState, geoplumb: &Geoplumb, watch: &DueWatch, now: O
             count,
             tripped,
         });
+    }
+    if tripped {
+        alert(state, watch, value, count, now).await;
     }
 }
 
@@ -946,12 +1034,22 @@ mod tests {
         DueWatch {
             id: Uuid::new_v4(),
             document_id: Uuid::new_v4(),
+            name: "reservoir".to_string(),
             layer: "ndvi".to_string(),
             region: square(),
             reducer: Reducer::Mean,
             threshold_op: threshold.map(|(op, _)| op),
             threshold_value: threshold.map(|(_, value)| value),
+            webhook_url: None,
+            webhook_secret: None,
         }
+    }
+
+    #[test]
+    fn a_trip_says_what_crossed_and_what_it_crossed() {
+        let watch = watching(Some((ThresholdOp::Lt, 0.4)));
+        assert_eq!(trip_excerpt(&watch, 0.31), "reservoir: mean 0.31 lt 0.4");
+        assert_eq!(trip_excerpt(&watching(None), 0.31), "reservoir: mean 0.31");
     }
 
     #[test]

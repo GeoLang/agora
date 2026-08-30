@@ -4,6 +4,20 @@
 
 ### Added
 
+- 2026-08-30: **a watch that crosses its threshold alerts**. A reading that
+  satisfies `thresholdOp thresholdValue` where the one before it did not writes
+  one notification per current member (migration 010: `notifications.comment_id`
+  is nullable and a `watch_id` sits beside it, exactly one of the two set) and,
+  when the watch carries a `webhookUrl`, posts
+  `{event, occurredAt, data}` signed `X-Agora-Signature: sha256=<hmac>` beside
+  `X-Agora-Event` and `X-Agora-Delivery`, the scheme ptolemy and tiletopia
+  already send. Three attempts with a doubling backoff, no redirects, and a
+  delivery that never lands leaves the reading and the notifications alone. The
+  url is checked against the platform's own address ranges when the watch is
+  made and again before every attempt, with the host pinned to the address that
+  passed, since agora dials it from inside a network where the other services
+  answer with no credential.
+
 - 2026-08-30: **watches run on a schedule**. A background task ticks every 30
   seconds and runs the watches whose interval has run out, oldest first, up to
   16 a tick and one at a time. A run is one `POST {GEOPLUMB_URL}/zonal/{layer}`

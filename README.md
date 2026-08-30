@@ -139,7 +139,7 @@ anything else.
 | `GET /attachments/{token}` | Reads an attachment. No credential beyond the token. |
 | `DELETE /links/{token}` | Revokes a share link, edit role only. |
 | `GET /links/{token}` | Resolves a link to `{"doc": "...", "role": "...", "sessionToken": "..."}`. |
-| `GET /notifications` | The caller's latest 50 mention notifications, newest first. Hard capped, with no pagination and no total count, so a caller past 50 unread never sees the rest. |
+| `GET /notifications` | The caller's latest 50 mention and watch notifications, newest first. Hard capped, with no pagination and no total count, so a caller past 50 unread never sees the rest. |
 | `POST /notifications/read` `{"ids": ["..."]}` | Marks the caller's notifications read, every unread one when `ids` is absent. |
 
 Bodies and query strings are read strictly. A key the route does not define is
@@ -362,6 +362,55 @@ every tick, and the next reading clears the error.
 Readings are kept for 30 days, the same window a sensor reading gets, and a
 watch keeps its newest 10000 whatever the window says.
 
+### Tripping
+
+A watch trips on the reading that satisfies `thresholdOp thresholdValue` where
+the reading before it did not. Staying over the line does not trip again, and
+coming back under and crossing a second time does. A first reading past the line
+trips, since there is no earlier reading holding it back, and a watch with no
+threshold never trips at all.
+
+A trip writes one notification per current member, which they read through
+`GET /notifications` beside their mentions: `watchId` names the watch,
+`commentId` is null, `authorName` is the watch's name and `excerpt` reads
+`reservoir: mean 0.31 lt 0.4`.
+
+### Webhooks
+
+A watch with a `webhookUrl` also gets a POST, inside the scheduler run and right
+after the notification:
+
+```
+POST <webhookUrl>
+Content-Type: application/json
+X-Agora-Event: watch.tripped
+X-Agora-Delivery: <uuid>
+X-Agora-Signature: sha256=<hex>
+
+{"event": "watch.tripped", "occurredAt": "...", "data": {"watchId": "...", "documentId": "...", "name": "reservoir", "layer": "ndvi", "reducer": "mean", "value": 0.31, "count": 4096, "at": "..."}}
+```
+
+The signature is the HMAC-SHA256 of the exact body under `webhookSecret`, and it
+is absent when the watch carries no secret. Recompute it over the raw bytes
+before trusting a delivery. It is the header scheme ptolemy and tiletopia send,
+so a receiver written for one of them reads all three.
+
+Three attempts, two seconds before the second and doubling after that, ten
+seconds a try, and no redirects: a 3xx ends the attempt rather than being
+followed, since the url it names is one nobody checked. A delivery that never
+lands is recorded in `lastError` and costs the watch nothing else, its reading
+and its notifications included.
+
+Agora dials that url from inside the platform network, where ptolemy, geoplumb
+and the database answer with no credential. So a url whose host resolves to a
+loopback, link local, private or otherwise internal address is refused when the
+watch is created, and again before every attempt, and a named host is pinned to
+the address that check passed so nothing can move the name in between. A host
+that does not resolve is accepted at create time and refused at delivery, which
+is what lets a receiver be registered before it is up. Everything else on the
+internet is reachable, so a webhook url is as much a way out of this network as
+any other outbound request agora makes.
+
 ## Websocket
 
 `GET /ws?doc=<id>` and optionally `&since=<seq>`.
@@ -513,6 +562,7 @@ one is an `error` message or a 4xx, never a panic.
 | Watch readings per list call | 500 |
 | Watch readings kept per watch | 10000, on top of the 30 day window |
 | Watches run per tick | 16, one at a time, every 30 seconds |
+| Webhook delivery | 3 attempts, 10 seconds each, 2 seconds of backoff doubling between them |
 
 Share link tokens are 128 random bits and attachment tokens 256, url safe.
 Session tokens expire after 12 hours and feed tokens after ten years, since a

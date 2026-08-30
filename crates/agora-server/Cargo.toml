@@ -13,6 +13,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hex = "0.4"
+hmac = "0.12"
 # 9, not 10: 10 pulls rsa 0.9 (RUSTSEC-2023-0071) and fails cargo-deny
 jsonwebtoken = "9"
 rand = "0.9"
@@ -43,7 +44,9 @@ tower-http = { version = "0.7", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+sha2 = "0.10"
 tokio = { version = "1", features = ["time"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
     "connect",

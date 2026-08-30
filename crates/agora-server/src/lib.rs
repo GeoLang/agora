@@ -16,6 +16,7 @@ pub mod role;
 pub mod room;
 pub mod state;
 pub mod watches;
+pub mod webhooks;
 pub mod ws;
 
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use crate::auth::AuthConfig;
 use crate::projects::ProjectAccess;
 use crate::room::RoomRegistry;
 use crate::watches::Geoplumb;
+use crate::webhooks::Webhooks;
 
 pub const DATABASE_URL_ENV: &str = "DATABASE_URL";
 pub const PORT_ENV: &str = "PORT";
@@ -50,6 +52,9 @@ pub struct AppState {
     /// `None` turns region watches off, which is where a build with no
     /// [`watches::GEOPLUMB_URL_ENV`] lands.
     pub geoplumb: Option<Arc<Geoplumb>>,
+    /// How a tripped watch's alerts are delivered. Refuses the platform's own
+    /// network unless [`AppState::with_webhooks`] says otherwise.
+    pub webhooks: Webhooks,
 }
 
 impl AppState {
@@ -63,6 +68,7 @@ impl AppState {
             rooms: Arc::new(RoomRegistry::new()),
             projects: None,
             geoplumb: None,
+            webhooks: Webhooks::refusing_private_hosts(),
         }
     }
 
@@ -73,6 +79,11 @@ impl AppState {
 
     pub fn with_geoplumb(mut self, geoplumb: Geoplumb) -> Self {
         self.geoplumb = Some(Arc::new(geoplumb));
+        self
+    }
+
+    pub fn with_webhooks(mut self, webhooks: Webhooks) -> Self {
+        self.webhooks = webhooks;
         self
     }
 }
