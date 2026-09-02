@@ -44,7 +44,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <header>
 <div class="container">
 <h1>🤝 Agora</h1>
-<p class="tagline">Live multiplayer session service for GeoLang composition documents. One JSON document holds a shared map — layers, annotations, bookmarks, comments — and Agora owns it, orders every edit, and fans the edits out to everyone looking at it.</p>
+<p class="tagline">Everyone edits one map at the same time. A single JSON document holds the layers, annotations, bookmarks, comments and sensor assets, and Agora orders every edit and sends it to everyone who has the document open.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
@@ -58,7 +58,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="stats">
 <div class="stat"><div class="num">1</div><div class="label">Ordered op stream per document</div></div>
 <div class="stat"><div class="num">2</div><div class="label">Member roles: view, edit</div></div>
-<div class="stat"><div class="num">6</div><div class="label">Postgres tables</div></div>
+<div class="stat"><div class="num">10</div><div class="label">Postgres tables</div></div>
 <div class="stat"><div class="num">0</div><div class="label">Credentials in a share URL (token, hashed at rest)</div></div>
 </div>
 </div>
@@ -98,6 +98,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Comments live in the document like any other keyed state</li>
 <li>@-mentions create notifications for the mentioned user</li>
+<li>A watch crossing its threshold notifies members the same way</li>
 <li>Notification list and mark-read endpoints</li>
 </ul>
 </div>
@@ -106,6 +107,34 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Binary blobs referenced from the document</li>
 <li>Fetched by token, so image overlays work in a browser</li>
+<li>An attachment nothing points at for seven days is deleted</li>
+</ul>
+</div>
+<div class="card">
+<h3>🗂️ Project Roles</h3>
+<ul>
+<li>A document can name a Ptolemy project</li>
+<li>A project viewer reads it, an editor or owner edits it</li>
+<li>The wider of the project role and the members row applies</li>
+<li>No answer from Ptolemy leaves the members row as the only authority</li>
+</ul>
+</div>
+<div class="card">
+<h3>📡 Sensor Feeds</h3>
+<ul>
+<li>A feed reports readings on its own WebSocket, one token per feed</li>
+<li>The latest value per asset and kind, now or as of a past moment</li>
+<li>An asset that misses three reporting intervals is called offline</li>
+<li>Readings are kept 30 days</li>
+</ul>
+</div>
+<div class="card">
+<h3>🛰️ Region Watches</h3>
+<ul>
+<li>A GeoJSON region reduced over one Geoplumb layer on a schedule</li>
+<li>Reducers: mean, min, max, sum, count</li>
+<li>Crossing a threshold notifies every member</li>
+<li>An optional signed webhook carries the same event out</li>
 </ul>
 </div>
 <div class="card">
@@ -114,6 +143,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Ops, batched ops, and presence messages</li>
 <li>Presence is relayed, never persisted</li>
 <li>Frame and batch size limits refuse oversized input</li>
+<li>Readings, asset liveness and watch results arrive beside the ops</li>
 <li>Bearer token offered as a subprotocol, echoed never</li>
 </ul>
 </div>
@@ -122,7 +152,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Platform HS256 JWTs, same secret as the other services</li>
 <li>Scopes: <code>agora:read</code> for GET, <code>agora:write</code> for the rest</li>
-<li>Authorization decided by the members table per document</li>
+<li>Authorization from the members table, widened by a project role</li>
+<li>A feed token reaches the ingest socket and no other route</li>
 <li>Fail-closed: no secret, no start</li>
 </ul>
 </div>
@@ -139,19 +170,28 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </thead>
 <tbody>
 <tr><td>POST / GET</td><td><code>/documents</code></td><td>Create a document / list the caller's documents</td></tr>
-<tr><td>GET</td><td><code>/documents/{id}</code></td><td>Fetch a document (members only)</td></tr>
+<tr><td>GET</td><td><code>/documents/{id}</code></td><td>Fetch a document, for a member or anyone holding a role on its project</td></tr>
+<tr><td>PUT</td><td><code>/documents/{id}/project</code></td><td>Link the document to a project, or unlink it</td></tr>
 <tr><td>PUT / DELETE</td><td><code>/documents/{id}/members/{user_id}</code></td><td>Set or remove a member and role</td></tr>
 <tr><td>POST</td><td><code>/documents/{id}/links</code></td><td>Create a share link</td></tr>
 <tr><td>GET / DELETE</td><td><code>/links/{token}</code></td><td>Resolve or revoke a share link</td></tr>
 <tr><td>POST</td><td><code>/documents/{id}/attachments</code></td><td>Add an attachment</td></tr>
 <tr><td>GET</td><td><code>/attachments/{token}</code></td><td>Fetch an attachment blob</td></tr>
+<tr><td>POST / GET</td><td><code>/documents/{id}/feeds</code></td><td>Register a sensor feed and get its token / list the feeds</td></tr>
+<tr><td>DELETE</td><td><code>/documents/{id}/feeds/{feed_id}</code></td><td>Revoke a feed and delete its readings</td></tr>
+<tr><td>GET</td><td><code>/documents/{id}/assets</code></td><td>Latest value per asset and kind, with whether it is still reporting</td></tr>
+<tr><td>GET</td><td><code>/documents/{id}/assets/at</code></td><td>The same as of <code>?t=</code></td></tr>
+<tr><td>POST / GET</td><td><code>/documents/{id}/watches</code></td><td>Register a region watch / list the watches</td></tr>
+<tr><td>DELETE</td><td><code>/documents/{id}/watches/{watch_id}</code></td><td>Delete a watch, its readings and its notifications</td></tr>
+<tr><td>GET</td><td><code>/documents/{id}/watches/{watch_id}/readings</code></td><td>A watch's history, oldest first after <code>?since=</code></td></tr>
 <tr><td>GET</td><td><code>/notifications</code></td><td>List the caller's notifications</td></tr>
 <tr><td>POST</td><td><code>/notifications/read</code></td><td>Mark notifications read</td></tr>
 <tr><td>GET</td><td><code>/ws</code></td><td>WebSocket upgrade for a document session</td></tr>
+<tr><td>GET</td><td><code>/feeds/ws</code></td><td>WebSocket a sensor feed sends its readings on</td></tr>
 <tr><td>GET</td><td><code>/health</code></td><td>Health check</td></tr>
 </tbody>
 </table>
-<p style="margin-top:16px;color:var(--muted)">In the platform Compose stack, nginx serves all of this under <code>/agora/</code>.</p>
+<p style="margin-top:16px;color:var(--muted)">Bodies and query strings are read strictly: a key the route does not define is refused, so a misspelling is an error rather than a silent no-op. In the platform Compose stack, nginx serves all of this under <code>/agora/</code>.</p>
 </div>
 </section>
 
@@ -168,6 +208,8 @@ PLATFORM_JWT_SECRET=... DATABASE_URL=postgres://... cargo run -p agora-server</p
 <tr><td><code>PLATFORM_JWT_SECRET</code></td><td>yes</td><td>Shared HS256 secret, 32 bytes or more, the same one the other platform services validate</td></tr>
 <tr><td><code>DATABASE_URL</code></td><td>yes</td><td>Postgres connection string, carries the TLS mode</td></tr>
 <tr><td><code>PORT</code></td><td>no</td><td>Listen port, 3000 by default</td></tr>
+<tr><td><code>PTOLEMY_URL</code></td><td>no</td><td>Ptolemy's base url. Unset, project roles grant nothing and only the members table reaches a document</td></tr>
+<tr><td><code>GEOPLUMB_URL</code></td><td>no</td><td>Geoplumb's base url. Unset, region watches are off and creating one is a 400</td></tr>
 </tbody>
 </table>
 </div>
