@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-09-16: **four claims on the docs page now match the code**. The headline
+  stat read "0 credentials in a share URL" when the token in that URL is the
+  credential; it now says what is true, that no platform credential sits behind
+  a share link. "Revocable at any time" left out that a socket already open on
+  the revoked link keeps working until it drops. `GET /documents/{id}` was
+  described as fetching the document when it answers name, creation details,
+  project and members, the state arriving over the websocket. The checkpoint
+  paragraph now names the numbers in `limits.rs`: a fold every 256 ops and a
+  retained tail of 4096. The README was checked claim by claim against the
+  router, the migrations and `limits.rs`, and needed no change.
+
 ### Added
 
 - 2026-08-30: **a watch that crosses its threshold alerts**. A reading that

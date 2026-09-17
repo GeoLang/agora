@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agora — Live Map Collaboration</title>
+<title>Agora: live map collaboration</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e;--red:#f85149}
@@ -59,7 +59,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="stat"><div class="num">1</div><div class="label">Ordered op stream per document</div></div>
 <div class="stat"><div class="num">2</div><div class="label">Member roles: view, edit</div></div>
 <div class="stat"><div class="num">10</div><div class="label">Postgres tables</div></div>
-<div class="stat"><div class="num">0</div><div class="label">Credentials in a share URL (token, hashed at rest)</div></div>
+<div class="stat"><div class="num">0</div><div class="label">Platform credentials behind a share link. It mints its own short-lived token</div></div>
 </div>
 </div>
 </header>
@@ -67,7 +67,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <h2>How It Works</h2>
-<p>A document is one JSON object. Clients connect over a WebSocket, send operations, and the server assigns every operation a sequence number before fanning it out — the last writer on a key wins. A periodic checkpoint of the merged document is stored beside the op log, so a late joiner loads the checkpoint and replays the tail instead of the whole history. Agora runs as a single instance and is the only writer to its database.</p>
+<p>A document is one JSON object. Clients connect over a WebSocket and send operations. The server gives every operation a sequence number before fanning it out, and the last writer on a key wins. Every 256 ops the merged document is folded into a checkpoint beside the op log, and the last 4096 ops per document are kept, so a rejoining client replays that tail instead of taking a fresh snapshot. Agora runs as a single instance and is the only writer to its database.</p>
 </div>
 </section>
 
@@ -89,8 +89,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Tokened links granting view or edit</li>
 <li>Only the token hash is stored server-side</li>
-<li>Revocable at any time</li>
-<li>Visitors get short-lived session tokens, never platform credentials</li>
+<li>Revoking stops link resolution and any new socket. A socket already open on that link keeps working until it drops</li>
+<li>Visitors get a 12-hour session token, never a platform credential</li>
 </ul>
 </div>
 <div class="card">
@@ -170,7 +170,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </thead>
 <tbody>
 <tr><td>POST / GET</td><td><code>/documents</code></td><td>Create a document / list the caller's documents</td></tr>
-<tr><td>GET</td><td><code>/documents/{id}</code></td><td>Fetch a document, for a member or anyone holding a role on its project</td></tr>
+<tr><td>GET</td><td><code>/documents/{id}</code></td><td>Its name, creation details, project and members. The state itself comes over the WebSocket</td></tr>
 <tr><td>PUT</td><td><code>/documents/{id}/project</code></td><td>Link the document to a project, or unlink it</td></tr>
 <tr><td>PUT / DELETE</td><td><code>/documents/{id}/members/{user_id}</code></td><td>Set or remove a member and role</td></tr>
 <tr><td>POST</td><td><code>/documents/{id}/links</code></td><td>Create a share link</td></tr>
@@ -218,7 +218,7 @@ PLATFORM_JWT_SECRET=... DATABASE_URL=postgres://... cargo run -p agora-server</p
 <footer>
 <div class="container">
 <p>Agora is free software under the <a href="https://github.com/GeoLang/agora/blob/master/LICENSE">AGPL-3.0 license</a>.</p>
-<p style="margin-top:8px">Made by <a href="https://github.com/GeoLang">GeoLang</a> — collaboration for the open geospatial stack.</p>
+<p style="margin-top:8px">Made by <a href="https://github.com/GeoLang">GeoLang</a>.</p>
 <p>&copy; 2026 Grok Image Compression Inc. Licensed under AGPL-3.0-or-later.</p>
 </div>
 </footer>
