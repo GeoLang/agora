@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- 2026-09-23: **a geolang MCP token is no longer a caller**. A token carrying
+  `geolang_use` is refused on every HTTP route and both sockets, the way one
+  carrying `agora_use` already was. Tool tokens are unchanged.
 - 2026-09-16: **four claims on the docs page now match the code**. The headline
   stat read "0 credentials in a share URL" when the token in that URL is the
   credential; it now says what is true, that no platform credential sits behind

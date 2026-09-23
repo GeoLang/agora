@@ -4402,6 +4402,50 @@ async fn a_feed_token_is_refused_everywhere_a_caller_is_expected() {
     );
 }
 
+#[tokio::test]
+async fn a_geolang_mcp_token_is_refused_everywhere_a_caller_is_expected() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let owner_token = platform_token(&owner);
+    let document_id = create_document(&app, &owner_token, "twins").await;
+    let mcp_token = encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": owner,
+            "exp": time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+            "name": "Ann",
+            "geolang_use": "mcp",
+            "source_role": "editor"
+        }),
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .expect("sign an mcp token");
+
+    assert_eq!(
+        get_document(&app, &owner_token, document_id).await.status(),
+        200
+    );
+    assert_eq!(
+        get_document(&app, &mcp_token, document_id).await.status(),
+        401
+    );
+    assert_eq!(
+        app.client
+            .get(format!("{}/documents", app.http_base))
+            .bearer_auth(&mcp_token)
+            .send()
+            .await
+            .expect("list documents")
+            .status(),
+        401
+    );
+    assert_eq!(
+        handshake_status(connect_with_subprotocol(&app, document_id, &mcp_token, None).await),
+        Some(401),
+        "an mcp token opened the document socket"
+    );
+}
+
 /// The ingest handshake, with the feed token in the subprotocol offer.
 async fn connect_ingest(
     app: &TestApp,

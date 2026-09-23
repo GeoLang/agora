@@ -69,6 +69,9 @@ struct TokenClaims {
     /// agora's own sockets is not a caller on any route.
     #[serde(default)]
     agora_use: Option<String>,
+    // geolang's MCP token, which may only open geolang's own /mcp
+    #[serde(default)]
+    geolang_use: Option<String>,
 }
 
 enum VerifiedCaller {
@@ -161,7 +164,7 @@ impl AuthConfig {
         let claims = decode::<TokenClaims>(token, &self.decoding_key(), &Validation::default())
             .map_err(|_| VerificationError::Invalid)?
             .claims;
-        if claims.sub.is_empty() || claims.agora_use.is_some() {
+        if claims.sub.is_empty() || claims.agora_use.is_some() || claims.geolang_use.is_some() {
             return Err(VerificationError::Invalid);
         }
         let name = claims
@@ -654,6 +657,41 @@ mod tests {
                 Err(VerificationError::Invalid)
             ));
         }
+    }
+
+    #[test]
+    fn a_geolang_mcp_token_is_never_a_caller() {
+        let config = AuthConfig::new(SECRET).unwrap();
+        for claims in [
+            json!({"sub": "user-1", "exp": future(), "name": "Ann", "geolang_use": "mcp"}),
+            json!({
+                "sub": "user-1",
+                "exp": future(),
+                "name": "Ann",
+                "geolang_use": "mcp",
+                "source_role": "admin"
+            }),
+            json!({"sub": "user-1", "exp": future(), "geolang_use": "something-later"}),
+        ] {
+            let token = sign(&claims);
+            assert!(config.verify_platform(&token).is_none(), "{claims}");
+            for scope in [AGORA_READ_SCOPE, AGORA_WRITE_SCOPE] {
+                assert!(matches!(
+                    config.verify_for_scope(&token, scope),
+                    Err(VerificationError::Invalid)
+                ));
+            }
+        }
+
+        let platform = sign(&json!({"sub": "user-1", "exp": future(), "name": "Ann"}));
+        assert_eq!(config.verify_platform(&platform).unwrap().user_id, "user-1");
+        let tool = sign(&json!({
+            "sub": "user-1",
+            "exp": future(),
+            "token_use": "tool",
+            "scope": [AGORA_WRITE_SCOPE]
+        }));
+        assert!(config.verify_for_scope(&tool, AGORA_WRITE_SCOPE).is_ok());
     }
 
     #[test]
