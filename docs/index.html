@@ -43,7 +43,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <body>
 <header>
 <div class="container">
-<h1>🤝 Agora</h1>
+<h1>Agora</h1>
 <p class="tagline">Everyone edits one map at the same time. A single JSON document holds the layers, annotations, bookmarks, comments and sensor assets, and Agora orders every edit and sends it to everyone who has the document open.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
@@ -59,7 +59,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="stat"><div class="num">1</div><div class="label">Ordered op stream per document</div></div>
 <div class="stat"><div class="num">2</div><div class="label">Member roles: view, edit</div></div>
 <div class="stat"><div class="num">10</div><div class="label">Postgres tables</div></div>
-<div class="stat"><div class="num">0</div><div class="label">Platform credentials behind a share link. It mints its own short-lived token</div></div>
+<div class="stat"><div class="num">12</div><div class="label">Hours a share link session token lasts</div></div>
 </div>
 </div>
 </header>
@@ -67,7 +67,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <h2>How It Works</h2>
-<p>A document is one JSON object. Clients connect over a WebSocket and send operations. The server gives every operation a sequence number before fanning it out, and the last writer on a key wins. Every 256 ops the merged document is folded into a checkpoint beside the op log, and the last 4096 ops per document are kept, so a rejoining client replays that tail instead of taking a fresh snapshot. Agora runs as a single instance and is the only writer to its database.</p>
+<p>A document is one JSON object. Clients connect over a WebSocket and send operations. The server gives every operation a sequence number before sending it to every client on the document, and the last writer on a key wins. Every 256 ops the merged document is folded into a checkpoint beside the op log, and the last 4096 ops per document are kept, so a rejoining client replays that tail instead of taking a fresh snapshot. Agora runs as a single instance and is the only writer to its database.</p>
 </div>
 </section>
 
@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2>Features</h2>
 <div class="grid">
 <div class="card">
-<h3>📄 Documents &amp; Members</h3>
+<h3>Documents &amp; Members</h3>
 <ul>
 <li>UUID-keyed documents, creator becomes first editor</li>
 <li>Per-document members with view or edit role</li>
@@ -85,7 +85,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🔗 Share Links</h3>
+<h3>Share Links</h3>
 <ul>
 <li>Tokened links granting view or edit</li>
 <li>Only the token hash is stored server-side</li>
@@ -94,33 +94,34 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>💬 Comments &amp; Notifications</h3>
+<h3>Comments &amp; Notifications</h3>
 <ul>
 <li>Comments live in the document like any other keyed state</li>
-<li>@-mentions create notifications for the mentioned user</li>
+<li>A mention of a document member creates a notification for them</li>
 <li>A watch crossing its threshold notifies members the same way</li>
 <li>Notification list and mark-read endpoints</li>
 </ul>
 </div>
 <div class="card">
-<h3>📎 Attachments</h3>
+<h3>Attachments</h3>
 <ul>
-<li>Binary blobs referenced from the document</li>
-<li>Fetched by token, so image overlays work in a browser</li>
+<li>PNG, JPEG, WebP, GIF or AVIF images up to 16 MiB, uploaded apart from the ops</li>
+<li>Read by token with no other credential, so an image overlay loads in a browser</li>
 <li>An attachment nothing points at for seven days is deleted</li>
 </ul>
 </div>
 <div class="card">
-<h3>🗂️ Project Roles</h3>
+<h3>Project Roles</h3>
 <ul>
 <li>A document can name a Ptolemy project</li>
 <li>A project viewer reads it, an editor or owner edits it</li>
 <li>The wider of the project role and the members row applies</li>
 <li>No answer from Ptolemy leaves the members row as the only authority</li>
+<li>The document list includes documents reached through a project</li>
 </ul>
 </div>
 <div class="card">
-<h3>📡 Sensor Feeds</h3>
+<h3>Sensor Feeds</h3>
 <ul>
 <li>A feed reports readings on its own WebSocket, one token per feed</li>
 <li>The latest value per asset and kind, now or as of a past moment</li>
@@ -129,7 +130,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🛰️ Region Watches</h3>
+<h3>Region Watches</h3>
 <ul>
 <li>A GeoJSON region reduced over one Geoplumb layer on a schedule</li>
 <li>Reducers: mean, min, max, sum, count</li>
@@ -138,23 +139,23 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🔌 WebSocket Protocol</h3>
+<h3>WebSocket Protocol</h3>
 <ul>
 <li>Ops, batched ops, and presence messages</li>
 <li>Presence is relayed, never persisted</li>
 <li>Frame and batch size limits refuse oversized input</li>
 <li>Readings, asset liveness and watch results arrive beside the ops</li>
-<li>Bearer token offered as a subprotocol, echoed never</li>
+<li>Bearer token offered as a subprotocol, and only the <code>bearer</code> marker is echoed back</li>
 </ul>
 </div>
 <div class="card">
-<h3>🔐 Auth</h3>
+<h3>Auth</h3>
 <ul>
 <li>Platform HS256 JWTs, same secret as the other services</li>
-<li>Scopes: <code>agora:read</code> for GET, <code>agora:write</code> for the rest</li>
+<li>Tool token scopes: <code>agora:read</code> for GET, <code>agora:write</code> for the rest and for the document WebSocket</li>
 <li>Authorization from the members table, widened by a project role</li>
 <li>A feed token reaches the ingest socket and no other route</li>
-<li>Fail-closed: no secret, no start</li>
+<li>The server refuses to start without a secret of 32 bytes or more</li>
 </ul>
 </div>
 </div>
@@ -201,7 +202,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <pre># Build and run (migrations run at startup)
 git clone https://github.com/GeoLang/agora.git
 cd agora
-PLATFORM_JWT_SECRET=... DATABASE_URL=postgres://... cargo run -p agora-server</pre>
+PLATFORM_JWT_SECRET=... DATABASE_URL=postgres://... cargo run -p agora-server
+
+# or the image a v* tag publishes
+docker pull ghcr.io/geolang/agora:latest</pre>
 <table>
 <thead><tr><th>Variable</th><th>Required</th><th>Meaning</th></tr></thead>
 <tbody>

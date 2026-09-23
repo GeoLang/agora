@@ -2,10 +2,11 @@
 
 Live multiplayer session service for GeoLang composition documents. A document
 is one JSON object holding map layers, annotations, bookmarks and comments. Agora
-owns it, orders every edit, and fans the edits out to everyone looking at it.
+stores it, orders every edit and sends each edit to everyone who has the
+document open.
 
-Single instance. The server assigns a sequence number to every op, and the last
-writer on a key wins.
+Agora runs as a single instance. The server assigns a sequence number to every
+op, and the last writer on a key wins.
 
 ## Running
 
@@ -13,7 +14,8 @@ writer on a key wins.
 PLATFORM_JWT_SECRET=... DATABASE_URL=postgres://... cargo run -p agora-server
 ```
 
-Migrations run at startup.
+Migrations run at startup. A pushed `v*` tag publishes the Dockerfile's image as
+`ghcr.io/geolang/agora:<tag>` and `ghcr.io/geolang/agora:latest`.
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
@@ -35,13 +37,19 @@ wins and taking a document into a project never narrows who already had it.
 
 Set the link with `POST /documents` (`projectId`) or `PUT /documents/{id}/project`
 (`{"projectId": ...}`, `null` to unlink). Linking takes edit on the document and
-editor or owner on the project. Unlinking takes edit on the document alone.
+editor or owner on the project, asked of ptolemy with a platform token, so a
+scoped tool token cannot link. With `PTOLEMY_URL` unset, naming a project is a
+400. Unlinking takes edit on the document alone.
 
 Roles are read from ptolemy with the caller's own bearer token, cached for 30
 seconds per document and caller. Every way that call can fail, an unset
 `PTOLEMY_URL` included, leaves the caller with their members table role and
-nothing else. Share link visitors never get a project role: the link is their
-whole grant.
+nothing else. A scoped tool token is never forwarded to ptolemy, so it gets no
+project role either. Share link visitors never get a project role: the link is
+their whole grant.
+
+Mention and watch notifications go to members table rows only, so a caller who
+reaches a document through a project role alone gets none.
 
 ### Database TLS
 
@@ -111,16 +119,17 @@ notifications for that document. Notifications are served by `GET
 
 Every route needs `Authorization: Bearer <platform jwt>` except `GET /health`,
 `GET /links/{token}` and `GET /attachments/{token}`, which carry no credential
-beyond the token in the url.
+beyond the token in the url. The two sockets, `/ws` and `/feeds/ws`, take their
+token as described under Websocket and Feeds.
 
 A scoped tool token is also accepted, on every route and on the websocket. It is
 admitted when it carries `agora:read` for a `GET` or `HEAD` and `agora:write` for
-anything else.
+anything else. The websocket takes `agora:write`, even to read.
 
 | Route | Does |
 | --- | --- |
 | `POST /documents` `{"name": "...", "projectId": "..."}` | Creates a document. The caller becomes its edit member. `projectId` is optional and takes editor or owner on that project. |
-| `GET /documents` | The caller's documents. Members rows only, so a document reached through a project role alone is not listed. |
+| `GET /documents` | The caller's documents, newest first, as `{"id", "name", "role", "createdAt"}`. A document reached through a project role alone is listed too, with that role. |
 | `GET /documents/{id}` | Name, creation details, project and members. |
 | `PUT /documents/{id}/project` `{"projectId": "..."\|null}` | Links the document to a project or unlinks it. Edit role, plus editor or owner on the project when linking. |
 | `PUT /documents/{id}/members/{userId}` `{"role": "view"\|"edit"}` | Adds a member or changes their role, edit role only. Idempotent. |
@@ -201,20 +210,19 @@ Nothing caps how many attachments a document holds.
 
 ### Expiry
 
-There is no delete route. A client driven delete would fight per user undo and
-the reconnect tail, either of which can put back an entry that points at the
-attachment. Instead a sweep decides liveness from the document itself: an
+There is no delete route, because per user undo or the reconnect tail can put
+back an entry that points at a deleted attachment. A sweep decides instead: an
 attachment is live while the document's current state, the same state a joining
-client is sent, carries its url. Being pointed at refreshes it, and going seven
-days unpointed at deletes it.
+client is sent, carries its url. A sweep that finds the url refreshes the
+attachment, and seven days without being found deletes it.
 
 Keep the url the upload returned in the value. The sweep looks for
 `/attachments/<token>` anywhere in the serialized state, so an absolute url
 containing it counts too, but a value holding the bare token does not.
 
-Seven days because the grace period has to outlive anything that can restore a
-reference: a session's undo stack, which is per session and cleared when the
-session leaves, and the reconnect tail. A week of orphaned blobs costs nothing.
+The seven days have to outlast anything that can restore a reference: a
+session's undo stack, which is cleared when the session leaves, and the
+reconnect tail.
 
 Reading an attachment deliberately does not refresh it. Reads are cached as
 immutable, so agora never sees most of them and read driven liveness would call
@@ -293,7 +301,7 @@ than against now.
 
 An asset is online while its newest reading of any kind is at or after now minus
 three times its feed's interval. Three missed reports, so a single late one is
-not an outage. When an asset crosses that line the room sends
+not an outage. When an asset crosses that line the document socket sends
 `{"type": "liveness", "asset": "...", "online": false, "at": "..."}`, and the
 next reading sends the same frame with `online: true`. The check runs once a
 second over the documents somebody has open. A document nobody is looking at is
@@ -392,8 +400,8 @@ X-Agora-Signature: sha256=<hex>
 
 The signature is the HMAC-SHA256 of the exact body under `webhookSecret`, and it
 is absent when the watch carries no secret. Recompute it over the raw bytes
-before trusting a delivery. It is the header scheme ptolemy and tiletopia send,
-so a receiver written for one of them reads all three.
+before trusting a delivery. Ptolemy and tiletopia sign their webhooks the same
+way under their own header prefix, `X-Ptolemy-` and `X-TileTopia-`.
 
 Three attempts, two seconds before the second and doubling after that, ten
 seconds a try, and no redirects: a 3xx ends the attempt rather than being
@@ -434,12 +442,13 @@ The token is either a platform JWT of a member of the document or a
 `sessionToken` from a share link on that document.
 
 On connect the server sends either a `snapshot` or the ops after `since`, then
-`assets`, then `peers`. `peers` always ends the join sequence, so a client knows
-it is caught up when `peers` arrives. Ops after `since` are replayed only while
-the retained tail still reaches back that far, otherwise the client gets a
-snapshot. `assets` goes out on every join, a resume that missed nothing
-included, because asset state is not carried by ops and cannot be replayed from
-the tail.
+`assets`, then `watches`, then `peers`. `peers` always ends the join sequence,
+so a client knows it is caught up when `peers` arrives. Ops after `since` are
+replayed only while the retained tail still reaches back that far, otherwise the
+client gets a snapshot. A `since` equal to the current seq gets no ops and no
+snapshot. `assets` and `watches` go out on every join, a resume that missed
+nothing included, because neither is carried by ops and neither can be replayed
+from the tail.
 
 ### Client to server
 
@@ -491,8 +500,7 @@ digits, `-`, `_` or `.`. Anything else is refused.
 from the feeds on the document, described under Feeds above, and `assets` holds
 the same JSON as `GET /documents/{id}/assets`.
 
-`watches` goes out on every join, after `assets`, and holds every watch on the
-document. It never carries `webhookUrl` or `webhookSecret`, so a share link
+`watches` holds every watch on the document. It never carries `webhookUrl` or `webhookSecret`, so a share link
 guest on this socket sees what a watch measures and not where its alerts go.
 `watchReading` goes out on every watch run that produced a number, with
 `tripped` set on the run that crossed the watch's threshold. Neither is an op
@@ -556,7 +564,7 @@ one is an `error` message or a 4xx, never a panic.
 | Readings per ingest connection | 200 per second, so a frame at the 256 cap is refused by the rate limit first |
 | Watch name | 200 bytes, the same as a document name |
 | Watch interval | 60 seconds or more |
-| Watch region | 4000 ring positions and 256 KiB of JSON, both under what geoplumb reduces |
+| Watch region | 4000 ring positions and 256 KiB of JSON |
 | Layer name | 128 bytes of letters, digits, `-` and `_`, so it stays one url path segment |
 | Webhook url and secret | 2048 and 256 bytes |
 | Watch readings per list call | 500 |
