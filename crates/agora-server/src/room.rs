@@ -549,6 +549,24 @@ pub async fn oldest_retained_op(
     row.try_get::<Option<i64>, _>("oldest")
 }
 
+pub async fn replay_bytes(
+    pool: &PgPool,
+    document_id: Uuid,
+    after: i64,
+    through: i64,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        "select coalesce(sum(octet_length(key) + coalesce(octet_length(value::text), 0)), 0)::bigint
+         as bytes from ops where doc_id = $1 and seq > $2 and seq <= $3",
+    )
+    .bind(document_id)
+    .bind(after)
+    .bind(through)
+    .fetch_one(pool)
+    .await?;
+    row.try_get("bytes")
+}
+
 /// The ops after `after` and up to `through`, as the frames they were applied
 /// in: rows sharing a `batch_seq` come back as the one batch they went out as
 /// live, so a resuming client never sees a batch torn into single ops.

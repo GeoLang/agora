@@ -45,6 +45,8 @@ pub const CHECKPOINT_INTERVAL_OPS: u64 = 256;
 /// Ops kept per document so a reconnect can replay instead of resnapshotting.
 pub const RECONNECT_TAIL_OPS: i64 = 4096;
 
+pub const MAX_REPLAY_BYTES: i64 = 4 * 1024 * 1024;
+
 /// Lifetime of a share link session token, hours.
 pub const SESSION_TOKEN_LIFETIME_HOURS: i64 = 12;
 

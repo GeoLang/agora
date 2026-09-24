@@ -8,8 +8,9 @@ use agora_server::limits::{
     ATTACHMENT_GRACE_DAYS, MAX_ATTACHMENT_BYTES, MAX_BATCH_OPS, MAX_CLIENT_MESSAGES_PER_SECOND,
     MAX_DOCUMENT_NAME_BYTES, MAX_DOCUMENT_STATE_BYTES, MAX_FEED_READINGS_PER_FRAME,
     MAX_INBOUND_FRAME_BYTES, MAX_KEY_BYTES, MAX_OP_VALUE_BYTES, MAX_PEERS_PER_DOCUMENT,
-    MAX_PRESENCE_BYTES, MAX_READINGS_PER_WATCH, MAX_REGION_POSITIONS, MAX_USER_ID_BYTES,
-    MAX_WATCH_READINGS_PAGE, MIN_WATCH_INTERVAL_SECONDS, READINGS_RETENTION_DAYS, WEBHOOK_ATTEMPTS,
+    MAX_PRESENCE_BYTES, MAX_READINGS_PER_WATCH, MAX_REGION_POSITIONS, MAX_REPLAY_BYTES,
+    MAX_USER_ID_BYTES, MAX_WATCH_READINGS_PAGE, MIN_WATCH_INTERVAL_SECONDS,
+    READINGS_RETENTION_DAYS, WEBHOOK_ATTEMPTS,
 };
 use agora_server::projects::ProjectAccess;
 use agora_server::protocol::{BatchOp, OpValue, Peer};
@@ -1070,6 +1071,62 @@ async fn a_since_older_than_the_retained_tail_falls_back_to_a_snapshot() {
     reconnected.expect_message("assets").await;
     reconnected.expect_message("watches").await;
     reconnected.expect_message("peers").await;
+}
+
+#[tokio::test]
+async fn a_replay_past_the_byte_cap_falls_back_to_a_snapshot() {
+    let app = spawn_app().await;
+    let owner = fresh_user();
+    let token = platform_token(&owner);
+    let document_id = create_document(&app, &token, "replay cap").await;
+
+    let peer = Peer {
+        actor: owner.clone(),
+        name: owner.clone(),
+        role: DocumentRole::Edit,
+    };
+    let joined = app
+        .state
+        .rooms
+        .join(&app.state.pool, document_id, peer)
+        .await
+        .expect("join");
+    let chunk = json!("x".repeat(MAX_OP_VALUE_BYTES - 2));
+    let writes = MAX_REPLAY_BYTES / MAX_OP_VALUE_BYTES as i64 + 2;
+    let mut last_seq = 0;
+    for client_seq in 0..writes {
+        last_seq = joined
+            .room
+            .apply_op(
+                &app.state.pool,
+                &owner,
+                client_seq,
+                "layers/big",
+                Some(chunk.clone()),
+            )
+            .await
+            .expect("apply an op");
+    }
+    app.state
+        .rooms
+        .leave(document_id, joined.connection_id)
+        .await;
+
+    let mut from_start = open(&app, document_id, &token, Some(0)).await;
+    let snapshot = from_start.expect_message("snapshot").await;
+    assert_eq!(snapshot["seq"], last_seq);
+    assert_eq!(snapshot["state"]["layers"]["big"], chunk);
+    from_start.expect_message("assets").await;
+    from_start.expect_message("watches").await;
+    from_start.expect_message("peers").await;
+
+    let mut near_the_end = open(&app, document_id, &token, Some(last_seq - 3)).await;
+    for seq in last_seq - 2..=last_seq {
+        assert_eq!(near_the_end.expect_message("op").await["seq"], seq);
+    }
+    near_the_end.expect_message("assets").await;
+    near_the_end.expect_message("watches").await;
+    near_the_end.expect_message("peers").await;
 }
 
 #[tokio::test]

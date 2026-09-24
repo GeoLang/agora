@@ -19,12 +19,12 @@ use crate::documents::{effective_role, project_grant};
 use crate::error::ApiError;
 use crate::limits::{
     DIRECT_CHANNEL_CAPACITY, MAX_BATCH_OPS, MAX_INBOUND_FRAME_BYTES, MAX_PRESENCE_BYTES,
-    RateLimiter,
+    MAX_REPLAY_BYTES, RateLimiter,
 };
 use crate::links::live_link;
 use crate::protocol::{ClientMessage, Peer, ServerMessage};
 use crate::role::DocumentRole;
-use crate::room::{JoinError, Room, RoomEvent, oldest_retained_op, ops_between};
+use crate::room::{JoinError, Room, RoomEvent, oldest_retained_op, ops_between, replay_bytes};
 use crate::watches::watch_states;
 
 /// Display name for anyone who arrived through a share link. They have no
@@ -246,6 +246,10 @@ async fn document_messages(
     }
     if since == seq {
         return Vec::new();
+    }
+    match replay_bytes(pool, document_id, since, seq).await {
+        Ok(bytes) if bytes <= MAX_REPLAY_BYTES => {}
+        _ => return snapshot(),
     }
     match oldest_retained_op(pool, document_id).await {
         Ok(Some(oldest)) if oldest <= since + 1 => {

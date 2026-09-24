@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- 2026-09-24: **a resume whose missed ops exceed 4 MB gets a snapshot**.
+  `MAX_REPLAY_BYTES` caps the replay, so an old `since` no longer loads up to
+  4096 ops of 64 KB each per socket.
 - 2026-09-23: **a geolang MCP token is no longer a caller**. A token carrying
   `geolang_use` is refused on every HTTP route and both sockets, the way one
   carrying `agora_use` already was. Tool tokens are unchanged.
