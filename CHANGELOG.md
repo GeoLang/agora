@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- 2026-10-19: **attachments take `application/geo+json`**, for a viewer layer
+  too large to inline in a document value. Served with `nosniff` like images.
+
 ### Fixed
 
 - 2026-09-24: **a resume whose missed ops exceed 4 MB gets a snapshot**.

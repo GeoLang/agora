@@ -199,8 +199,9 @@ document's attachments away when the document row is deleted, but the API
 registers no `DELETE /documents/{id}`, so that path is reachable only through
 direct SQL.
 
-The content type has to be `image/png`, `image/jpeg`, `image/webp`, `image/gif`
-or `image/avif`, sent without a charset or with one. Anything a browser would
+The content type has to be `image/png`, `image/jpeg`, `image/webp`, `image/gif`,
+`image/avif` or `application/geo+json`, sent without a charset or with one. The
+viewer stores a layer too large to inline in a document value as GeoJSON. Anything a browser would
 execute, `text/html` and `image/svg+xml` above all, is a 400: reads carry no
 credential and come from agora's own origin, so a stored script would be an
 editor's code running on the platform origin. Reads also carry

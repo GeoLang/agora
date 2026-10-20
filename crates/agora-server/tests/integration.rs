@@ -2927,6 +2927,43 @@ async fn an_editor_uploads_an_attachment_and_anyone_with_the_url_reads_it() {
 }
 
 #[tokio::test]
+async fn a_layer_too_large_to_inline_reads_back_as_geojson() {
+    let app = spawn_app().await;
+    let owner_token = platform_token(&fresh_user());
+    let document_id = create_document(&app, &owner_token, "large layer").await;
+    let layer = br#"{"type":"FeatureCollection","features":[]}"#.to_vec();
+
+    let response = upload_attachment(
+        &app,
+        Some(&owner_token),
+        document_id,
+        "application/geo+json",
+        layer.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+    let created: Value = response.json().await.expect("json body");
+
+    let read = app
+        .client
+        .get(format!(
+            "{}{}",
+            app.http_base,
+            created["url"].as_str().expect("a url")
+        ))
+        .send()
+        .await
+        .expect("read attachment");
+    assert_eq!(read.status(), 200);
+    assert_eq!(read.headers()["content-type"], "application/geo+json");
+    assert_eq!(read.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        read.bytes().await.expect("bytes").as_ref(),
+        layer.as_slice()
+    );
+}
+
+#[tokio::test]
 async fn an_attachment_is_stored_only_as_a_token_hash() {
     let app = spawn_app().await;
     let owner_token = platform_token(&fresh_user());

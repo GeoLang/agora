@@ -29,12 +29,13 @@ const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 /// origin with no credential, so anything a browser executes, `text/html` and
 /// `image/svg+xml` above all, would be an editor's script running on the
 /// platform origin against everyone they send the url to.
-const ACCEPTED_CONTENT_TYPES: [&str; 5] = [
+const ACCEPTED_CONTENT_TYPES: [&str; 6] = [
     "image/png",
     "image/jpeg",
     "image/webp",
     "image/gif",
     "image/avif",
+    "application/geo+json",
 ];
 
 /// The stored form of a content type, or `None` when it is not one agora
@@ -90,7 +91,7 @@ pub async fn create_attachment(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     let content_type = accepted_content_type(declared)
-        .ok_or_else(|| ApiError::bad_request("attachment content type is not an accepted image"))?;
+        .ok_or_else(|| ApiError::bad_request("attachment content type is not one agora serves"))?;
 
     let bytes = to_bytes(body, MAX_ATTACHMENT_BYTES)
         .await
@@ -270,6 +271,10 @@ mod tests {
             Some("image/jpeg")
         );
         assert_eq!(accepted_content_type(" image/webp "), Some("image/webp"));
+        assert_eq!(
+            accepted_content_type("application/geo+json; charset=utf-8"),
+            Some("application/geo+json")
+        );
     }
 
     #[test]
@@ -280,6 +285,8 @@ mod tests {
             "image/svg+xml",
             "application/pdf",
             "application/octet-stream",
+            "application/json",
+            "application/javascript",
             "text/html; charset=utf-8",
             "image/png/../text/html",
             "image/pngx",
