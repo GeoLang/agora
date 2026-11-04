@@ -129,6 +129,11 @@ pub const MAX_WATCH_READINGS_PAGE: i64 = 500;
 /// How often the scheduler looks for watches whose interval has run out.
 pub const WATCH_TICK_SECONDS: u64 = 30;
 
+pub const WATCH_QUIET_SECONDS_BEFORE_BACKOFF: u64 = 600;
+
+// aurora pauses only after 300 seconds with no open connection from agora or ptolemy
+pub const WATCH_IDLE_TICK_SECONDS: u64 = 1800;
+
 /// Watches one tick runs. They run one at a time, because geoplumb reduces four
 /// regions at once and answers the rest a 503, so this bounds how long a tick
 /// takes as well as how much work one asks for.

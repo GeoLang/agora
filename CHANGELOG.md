@@ -7,6 +7,13 @@
 - 2026-10-19: **attachments take `application/geo+json`**, for a viewer layer
   too large to inline in a document value. Served with `nosniff` like images.
 
+### Changed
+
+- 2026-11-03: **the watch scheduler backs off when no watch is due**. After 10
+  minutes with none due it ticks every 30 minutes instead of every 30 seconds,
+  and a tick that runs a watch returns it to 30 seconds. An idle database
+  connection closes after 60 seconds, so Aurora can pause.
+
 ### Fixed
 
 - 2026-09-24: **a resume whose missed ops exceed 4 MB gets a snapshot**.

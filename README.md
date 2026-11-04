@@ -361,6 +361,11 @@ collection at 30 metre resolution and no `t`, which leaves geoplumb on the
 layer's own window. They run one at a time because geoplumb reduces four regions
 at once and answers the rest a 503.
 
+After 10 minutes in which no tick found a due watch, the scheduler ticks every
+30 minutes, so a new watch or one with a long interval can run up to 30 minutes
+late, and the delay carries into its next run. A tick that runs a watch returns
+the scheduler to 30 seconds.
+
 The reducer picks its own field out of the row that comes back, and that value
 and the pixel count are stored against the watch. Anything else, a refusal, a
 timeout, a body that is not a reduction, or a region that caught no pixels,
@@ -570,7 +575,7 @@ one is an `error` message or a 4xx, never a panic.
 | Webhook url and secret | 2048 and 256 bytes |
 | Watch readings per list call | 500 |
 | Watch readings kept per watch | 10000, on top of the 30 day window |
-| Watches run per tick | 16, one at a time, every 30 seconds |
+| Watches run per tick | 16, one at a time, every 30 seconds, or every 30 minutes after 10 minutes with none due |
 | Webhook delivery | 3 attempts, 10 seconds each, 2 seconds of backoff doubling between them |
 
 Share link tokens are 128 random bits and attachment tokens 256, url safe.

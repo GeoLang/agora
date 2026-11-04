@@ -19,7 +19,8 @@ use crate::limits::{
     MAX_LAST_ERROR_CHARS, MAX_LAYER_NAME_BYTES, MAX_READINGS_PER_WATCH, MAX_REGION_BYTES,
     MAX_REGION_POSITIONS, MAX_WATCH_READINGS_PAGE, MAX_WATCH_RUNS_PER_TICK,
     MAX_WEBHOOK_SECRET_BYTES, MAX_WEBHOOK_URL_BYTES, MIN_RING_POSITIONS,
-    MIN_WATCH_INTERVAL_SECONDS, WATCH_TICK_SECONDS,
+    MIN_WATCH_INTERVAL_SECONDS, WATCH_IDLE_TICK_SECONDS, WATCH_QUIET_SECONDS_BEFORE_BACKOFF,
+    WATCH_TICK_SECONDS,
 };
 use crate::notifications::record_watch_trip;
 use crate::projects::read_capped_body;
@@ -865,13 +866,38 @@ pub async fn run_due(state: &AppState, now: OffsetDateTime) -> usize {
     due.len()
 }
 
+struct NextTick {
+    wait: Duration,
+    quiet_for: Duration,
+}
+
+fn next_tick(quiet_for: Duration, ran: usize) -> NextTick {
+    if ran > 0 {
+        return NextTick {
+            wait: Duration::from_secs(WATCH_TICK_SECONDS),
+            quiet_for: Duration::ZERO,
+        };
+    }
+    let wait = if quiet_for < Duration::from_secs(WATCH_QUIET_SECONDS_BEFORE_BACKOFF) {
+        Duration::from_secs(WATCH_TICK_SECONDS)
+    } else {
+        Duration::from_secs(WATCH_IDLE_TICK_SECONDS)
+    };
+    NextTick {
+        wait,
+        quiet_for: quiet_for + wait,
+    }
+}
+
 /// Started by the binary and not by `router`, so a test drives one tick itself
 /// rather than racing this.
 pub async fn run_periodically(state: AppState) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(WATCH_TICK_SECONDS));
+    let mut quiet_for = Duration::ZERO;
     loop {
-        ticker.tick().await;
-        run_due(&state, OffsetDateTime::now_utc()).await;
+        let ran = run_due(&state, OffsetDateTime::now_utc()).await;
+        let next = next_tick(quiet_for, ran);
+        quiet_for = next.quiet_for;
+        tokio::time::sleep(next.wait).await;
     }
 }
 
@@ -887,6 +913,27 @@ mod tests {
             "type": "Polygon",
             "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]
         })
+    }
+
+    #[test]
+    fn quiet_ticks_back_off_and_a_run_returns_to_the_short_interval() {
+        let short = Duration::from_secs(WATCH_TICK_SECONDS);
+        let idle = Duration::from_secs(WATCH_IDLE_TICK_SECONDS);
+        let mut quiet_for = Duration::ZERO;
+        for _ in 0..WATCH_QUIET_SECONDS_BEFORE_BACKOFF / WATCH_TICK_SECONDS {
+            let next = next_tick(quiet_for, 0);
+            assert_eq!(next.wait, short);
+            quiet_for = next.quiet_for;
+        }
+
+        let backed_off = next_tick(quiet_for, 0);
+        assert_eq!(backed_off.wait, idle);
+        let still_backed_off = next_tick(backed_off.quiet_for, 0);
+        assert_eq!(still_backed_off.wait, idle);
+
+        let ran = next_tick(still_backed_off.quiet_for, 1);
+        assert_eq!(ran.wait, short);
+        assert_eq!(next_tick(ran.quiet_for, 0).wait, short);
     }
 
     #[test]

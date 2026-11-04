@@ -164,7 +164,11 @@ async fn health() -> &'static str {
 }
 
 pub async fn connect_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
-    PgPool::connect(database_url).await
+    sqlx::postgres::PgPoolOptions::new()
+        // aurora does not pause while any connection is open, idle ones included
+        .idle_timeout(std::time::Duration::from_secs(60))
+        .connect(database_url)
+        .await
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
