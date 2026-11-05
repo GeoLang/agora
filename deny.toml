@@ -44,6 +44,7 @@ unknown-registry = "deny"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
+    "https://github.com/GeoLang/platform-crates.git",
     "https://github.com/GeoLang/terrano.git",
     "https://github.com/GeoLang/projicio.git",
 ]

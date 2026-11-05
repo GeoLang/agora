@@ -67,7 +67,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <h2>How It Works</h2>
-<p>A document is one JSON object. Clients connect over a WebSocket and send operations. The server gives every operation a sequence number before sending it to every client on the document, and the last writer on a key wins. Every 256 ops the merged document is folded into a checkpoint beside the op log, and the last 4096 ops per document are kept, so a rejoining client replays that tail instead of taking a fresh snapshot. Agora runs as a single instance and is the only writer to its database.</p>
+<p>A document is one JSON object. Clients connect over a WebSocket and send operations. The server gives every operation a sequence number before sending it to every client on the document, and the last writer on a key wins. Every 256 ops the merged document is folded into a checkpoint beside the op log, and the last 4096 ops per document are kept, so a rejoining client replays the ops it missed instead of taking a fresh snapshot, unless they reach back past that tail or come to more than 4 MiB. Agora runs as a single instance and is the only writer to its database.</p>
 </div>
 </section>
 
@@ -105,7 +105,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>Attachments</h3>
 <ul>
-<li>PNG, JPEG, WebP, GIF or AVIF images up to 16 MiB, uploaded apart from the ops</li>
+<li>PNG, JPEG, WebP, GIF or AVIF images and GeoJSON files up to 16 MiB, uploaded apart from the ops</li>
 <li>Read by token with no other credential, so an image overlay loads in a browser</li>
 <li>An attachment nothing points at for seven days is deleted</li>
 </ul>

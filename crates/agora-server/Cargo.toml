@@ -13,9 +13,10 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hex = "0.4"
-hmac = "0.12"
-# 9, not 10: 10 pulls rsa 0.9 (RUSTSEC-2023-0071) and fails cargo-deny
-jsonwebtoken = "9"
+# aws_lc_rs, not rust_crypto: rust_crypto pulls rsa 0.9 (RUSTSEC-2023-0071)
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+platform-auth = { git = "https://github.com/GeoLang/platform-crates.git", branch = "master" }
+platform-webhook = { git = "https://github.com/GeoLang/platform-crates.git", branch = "master" }
 rand = "0.9"
 # rustls-tls-webpki-roots pulls rustls/ring, the same provider sqlx's
 # tls-rustls-ring already brings. A second provider in one binary leaves rustls
@@ -27,8 +28,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-# tls-rustls-ring, not the tls-rustls alias: ring is already here through
-# jsonwebtoken, and naming it keeps a future sqlx from pulling aws-lc-rs instead.
+# tls-rustls-ring, not the tls-rustls alias: naming ring keeps a future sqlx from
+# turning on rustls's aws-lc-rs provider, which is the second provider above.
 sqlx = { version = "0.8", features = [
     "runtime-tokio",
     "tls-rustls-ring",

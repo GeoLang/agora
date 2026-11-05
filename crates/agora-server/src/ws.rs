@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::assets::asset_states;
-use crate::auth::{AGORA_WRITE_SCOPE, BEARER_SUBPROTOCOL, VerificationError, websocket_token};
+use crate::auth::{AGORA_WRITE_SCOPE, VerificationError, websocket_token};
 use crate::documents::{effective_role, project_grant};
 use crate::error::ApiError;
 use crate::limits::{
@@ -117,7 +117,7 @@ pub async fn websocket(
     Ok(upgrade
         // echoing the marker is what lets a browser accept the 101, and only the
         // marker is echoed, never the token beside it
-        .protocols([BEARER_SUBPROTOCOL])
+        .protocols([platform_auth::BEARER_SUBPROTOCOL])
         .max_message_size(MAX_INBOUND_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
             run(state, socket, document_id, since, identity).await;

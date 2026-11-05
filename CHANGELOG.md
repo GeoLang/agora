@@ -9,6 +9,27 @@
 
 ### Changed
 
+- 2026-11-04: **token checks and the webhook guard come from `platform-auth` and
+  `platform-webhook`**. A refused webhook url now reads "webhook host is inside
+  the platform network", and "webhook url has no host" is gone because such a url
+  is refused as "webhook url is not a url". Webhook deliveries ignore
+  `HTTP_PROXY` and `HTTPS_PROXY`. A platform token whose `role` is not a string
+  is now refused with 401, where the role used to be ignored. A platform or tool
+  token with a `token_use`, `agora_use` or `geolang_use` claim set to null, and a
+  platform, tool or feed token with a non-string `aud`, used to pass and are now
+  refused. `jsonwebtoken` moves from 9 to 11 on the aws-lc-rs backend.
+- 2026-11-04: **webhook urls refuse more addresses**. Creating a watch and every
+  delivery attempt now refuse 192.0.0.0/24, the 6to4 relay 192.88.99.0/24, the
+  benchmarking range 198.18.0.0/15, the documentation ranges 192.0.2.0/24,
+  198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32 and 3fff::/20, site-local
+  fec0::/10 and the NAT64 local-use prefix 64:ff9b:1::/48. The same goes for a
+  NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001::/32` or IPv4-compatible
+  `::/96` address whose embedded IPv4 address is not public, so
+  `64:ff9b::a9fe:a9fe` no longer reaches 169.254.169.254. A watch stored earlier
+  with such an address fails its deliveries and sends nothing.
+- 2026-11-04: **the release workflow calls `docker-image.yml` in
+  `GeoLang/.github`**. The image tags are unchanged. The actions move to checkout
+  v7, setup-buildx v4, login v4 and build-push v7.
 - 2026-11-03: **the watch scheduler backs off when no watch is due**. After 10
   minutes with none due it ticks every 30 minutes instead of every 30 seconds,
   and a tick that runs a watch returns it to 30 seconds. An idle database
@@ -16,6 +37,9 @@
 
 ### Fixed
 
+- 2026-11-04: **the README and docs page now match resume and attachments**. A
+  resume past 4 MiB of missed ops gets a snapshot, and the Limits table lists
+  that cap. Attachments are described as images and GeoJSON files.
 - 2026-09-24: **a resume whose missed ops exceed 4 MB gets a snapshot**.
   `MAX_REPLAY_BYTES` caps the replay, so an old `since` no longer loads up to
   4096 ops of 64 KB each per socket.

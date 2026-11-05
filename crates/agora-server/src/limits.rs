@@ -147,9 +147,6 @@ pub const MAX_LAST_ERROR_CHARS: usize = 200;
 pub const WEBHOOK_ATTEMPTS: u32 = 3;
 pub const WEBHOOK_BACKOFF_SECONDS: u64 = 2;
 
-/// Ceiling on one webhook attempt.
-pub const WEBHOOK_TIMEOUT_SECONDS: u64 = 10;
-
 /// How long a reading is kept.
 pub const READINGS_RETENTION_DAYS: i64 = 30;
 

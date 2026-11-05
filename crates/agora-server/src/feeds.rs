@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::assets::{rfc3339, valid_reading_identifier};
-use crate::auth::{BEARER_SUBPROTOCOL, Caller, websocket_token};
+use crate::auth::{Caller, websocket_token};
 use crate::documents::{project_grant, require_editor, require_member};
 use crate::error::ApiError;
 use crate::limits::{
@@ -203,7 +203,7 @@ pub async fn ingest(
         .ok_or_else(refused)?;
 
     Ok(upgrade
-        .protocols([BEARER_SUBPROTOCOL])
+        .protocols([platform_auth::BEARER_SUBPROTOCOL])
         .max_message_size(MAX_INBOUND_FRAME_BYTES)
         .on_upgrade(move |socket| async move {
             run(state, socket, feed).await;

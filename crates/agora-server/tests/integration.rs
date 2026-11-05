@@ -17,10 +17,11 @@ use agora_server::protocol::{BatchOp, OpValue, Peer};
 use agora_server::role::DocumentRole;
 use agora_server::state::META_NAME_KEY;
 use agora_server::watches::{Geoplumb, run_due};
-use agora_server::webhooks::{PrivateHosts, Webhooks};
+use agora_server::webhooks::Webhooks;
 use agora_server::{AppState, migrate, router};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use platform_webhook::PrivateHosts;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use tokio::net::{TcpListener, TcpStream};
@@ -5465,7 +5466,10 @@ async fn spawn_app_with_geoplumb(stub: &GeoplumbStub) -> TestApp {
     serve(
         AppState::new(test_pool().await, auth)
             .with_geoplumb(geoplumb)
-            .with_webhooks(Webhooks::new(TEST_WEBHOOK_BACKOFF, PrivateHosts::Allowed)),
+            .with_webhooks(Webhooks::new(
+                TEST_WEBHOOK_BACKOFF,
+                PrivateHosts::AllowedForTestReceiver,
+            )),
     )
     .await
 }

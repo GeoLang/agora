@@ -34,10 +34,10 @@ impl ApiError {
         }
     }
 
-    pub fn bad_request(message: &'static str) -> Self {
+    pub fn bad_request(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            message: Cow::Borrowed(message),
+            message: message.into(),
         }
     }
 

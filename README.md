@@ -135,7 +135,7 @@ anything else. The websocket takes `agora:write`, even to read.
 | `PUT /documents/{id}/members/{userId}` `{"role": "view"\|"edit"}` | Adds a member or changes their role, edit role only. Idempotent. |
 | `DELETE /documents/{id}/members/{userId}` | Removes a member, edit role only. |
 | `POST /documents/{id}/links` `{"role": "view"\|"edit"}` | Mints a share link, edit role only. Returns `{"token": "..."}`. |
-| `POST /documents/{id}/attachments` | Stores one image against the document, edit role only. Raw body, `Content-Type` header. Returns `{"token": "...", "url": "/attachments/..."}`. |
+| `POST /documents/{id}/attachments` | Stores one image or GeoJSON file against the document, edit role only. Raw body, `Content-Type` header. Returns `{"token": "...", "url": "/attachments/..."}`. |
 | `POST /documents/{id}/feeds` `{"name": "...", "intervalSeconds": 5}` | Registers a sensor feed, edit role only. Returns `{"id", "name", "intervalSeconds", "token"}`, and the token appears here and nowhere else. |
 | `GET /documents/{id}/feeds` | The document's feeds: `{"id", "name", "intervalSeconds", "createdBy", "createdAt"}`. Never the token. |
 | `DELETE /documents/{id}/feeds/{feedId}` | Revokes a feed and deletes its readings, edit role only. |
@@ -419,11 +419,13 @@ Agora dials that url from inside the platform network, where ptolemy, geoplumb
 and the database answer with no credential. So a url whose host resolves to a
 loopback, link local, private or otherwise internal address is refused when the
 watch is created, and again before every attempt, and a named host is pinned to
-the address that check passed so nothing can move the name in between. A host
-that does not resolve is accepted at create time and refused at delivery, which
-is what lets a receiver be registered before it is up. Everything else on the
-internet is reachable, so a webhook url is as much a way out of this network as
-any other outbound request agora makes.
+the address that check passed so nothing can move the name in between.
+Deliveries connect directly and ignore `HTTP_PROXY` and `HTTPS_PROXY`, because a
+proxy looks the name up again past that pin. A host that does not resolve is
+accepted at create time and refused at delivery, which is what lets a receiver
+be registered before it is up. Everything else on the internet is reachable, so
+a webhook url is as much a way out of this network as any other outbound request
+agora makes.
 
 ## Websocket
 
@@ -450,11 +452,11 @@ The token is either a platform JWT of a member of the document or a
 On connect the server sends either a `snapshot` or the ops after `since`, then
 `assets`, then `watches`, then `peers`. `peers` always ends the join sequence,
 so a client knows it is caught up when `peers` arrives. Ops after `since` are
-replayed only while the retained tail still reaches back that far, otherwise the
-client gets a snapshot. A `since` equal to the current seq gets no ops and no
-snapshot. `assets` and `watches` go out on every join, a resume that missed
-nothing included, because neither is carried by ops and neither can be replayed
-from the tail.
+replayed only while the retained tail still reaches back that far and they come
+to at most 4 MiB, otherwise the client gets a snapshot. A `since` equal to the
+current seq gets no ops and no snapshot. `assets` and `watches` go out on every
+join, a resume that missed nothing included, because neither is carried by ops
+and neither can be replayed from the tail.
 
 ### Client to server
 
@@ -577,6 +579,7 @@ one is an `error` message or a 4xx, never a panic.
 | Watch readings kept per watch | 10000, on top of the 30 day window |
 | Watches run per tick | 16, one at a time, every 30 seconds, or every 30 minutes after 10 minutes with none due |
 | Webhook delivery | 3 attempts, 10 seconds each, 2 seconds of backoff doubling between them |
+| Ops replayed on a resume | 4 MiB of keys and values, past that the client gets a snapshot |
 
 Share link tokens are 128 random bits and attachment tokens 256, url safe.
 Session tokens expire after 12 hours and feed tokens after ten years, since a
@@ -601,11 +604,12 @@ readings in `watch_readings`, keyed by watch and time.
 
 Ops are appended to `ops` and folded into `documents.checkpoint` every 256 ops
 after the last fold (`seq - checkpoint_seq`). The fold and the prune run in one
-transaction, and the last 4096 ops per document are kept so a reconnect can
-replay rather than resnapshot. A room is loaded from the checkpoint plus that
-tail on the first join and dropped when the last connection leaves. The interval
-is the stored gap, not ops in the current room lifetime, so a document edited
-only in short sessions still folds once that gap reaches 256.
+transaction, and the last 4096 ops per document are kept so a reconnect that
+missed at most 4 MiB of them can replay rather than resnapshot. A room is loaded
+from the checkpoint plus that tail on the first join and dropped when the last
+connection leaves. The interval is the stored gap, not ops in the current room
+lifetime, so a document edited only in short sessions still folds once that gap
+reaches 256.
 
 ## Tests
 

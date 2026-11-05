@@ -3,6 +3,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use platform_webhook::{WebhookUrl, check_webhook_registration};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -289,18 +290,11 @@ fn valid_region(region: &Value) -> Result<(), &'static str> {
 
 /// A webhook url has to be one agora can post to. The scheme and host are
 /// checked here, and where it resolves to is checked again at delivery time.
-fn valid_webhook_url(url: &str) -> Result<reqwest::Url, &'static str> {
+fn valid_webhook_url(url: &str) -> Result<WebhookUrl, String> {
     if url.len() > MAX_WEBHOOK_URL_BYTES {
-        return Err("webhook url too long");
+        return Err("webhook url too long".to_string());
     }
-    let parsed = reqwest::Url::parse(url).map_err(|_| "webhook url is not a url")?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("webhook url must be http or https");
-    }
-    if parsed.host().is_none() {
-        return Err("webhook url has no host");
-    }
-    Ok(parsed)
+    WebhookUrl::parse(url).map_err(|error| error.to_string())
 }
 
 /// No `Debug`: `webhook_secret` is a signing key and must never reach a log
@@ -433,11 +427,9 @@ pub async fn create_watch(
     }
     if let Some(url) = request.webhook_url.as_deref() {
         let url = valid_webhook_url(url).map_err(ApiError::bad_request)?;
-        state
-            .webhooks
-            .is_worth_registering(&url)
+        check_webhook_registration(&url, state.webhooks.private_hosts)
             .await
-            .map_err(ApiError::bad_request)?;
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
     }
     if request
         .webhook_secret
@@ -1042,7 +1034,10 @@ mod tests {
             assert!(valid_webhook_url(url).is_err(), "{url:?}");
         }
         let long = format!("https://example.test/{}", "a".repeat(MAX_WEBHOOK_URL_BYTES));
-        assert_eq!(valid_webhook_url(&long), Err("webhook url too long"));
+        assert_eq!(
+            valid_webhook_url(&long),
+            Err("webhook url too long".to_string())
+        );
     }
 
     #[test]

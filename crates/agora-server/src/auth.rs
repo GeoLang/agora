@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRef, FromRequestParts};
+use axum::http::HeaderMap;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use platform_auth::{
+    InvalidToken, TokenAuthority, VerifiedToken, bearer_token, decode_token, subprotocol_token,
+    verify_token,
+};
 use rand::{RngCore, rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,56 +32,17 @@ pub const MIN_SECRET_LEN: usize = 32;
 /// `aud` is not one the validation expects, so neither kind can be replayed as
 /// the other even though both are signed with the same secret.
 pub const SESSION_AUDIENCE: &str = "agora-session";
-const TOOL_TOKEN_USE: &str = "tool";
 
 /// Private claim marking a token as reaching the sensor ingest socket and
 /// nothing else.
 ///
 /// A private claim and not an `aud`, because every platform service validates
 /// with `Validation::default()`, which refuses a token carrying any audience at
-/// all. [`AuthConfig::decode_caller`] refuses every token carrying this claim,
+/// all. [`platform_auth::verify_token`] refuses every token carrying this claim,
 /// so a feed token is not a caller anywhere.
 const FEED_TOKEN_USE: &str = "feed";
 pub const AGORA_READ_SCOPE: &str = "agora:read";
 pub const AGORA_WRITE_SCOPE: &str = "agora:write";
-
-/// Claims on a platform token. The platform `role` claim is deliberately not
-/// read: authorization comes from this document's members row and from the
-/// project it names, never from something the token asserts about itself.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformClaims {
-    pub sub: String,
-    pub exp: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenClaims {
-    sub: String,
-    #[serde(rename = "exp")]
-    _exp: usize,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    role: Option<serde_json::Value>,
-    #[serde(default)]
-    token_use: Option<String>,
-    #[serde(default)]
-    scope: Option<serde_json::Value>,
-    /// Read only to refuse it. Whatever it says, a token scoped to one of
-    /// agora's own sockets is not a caller on any route.
-    #[serde(default)]
-    agora_use: Option<String>,
-    // geolang's MCP token, which may only open geolang's own /mcp
-    #[serde(default)]
-    geolang_use: Option<String>,
-}
-
-enum VerifiedCaller {
-    Platform(Caller),
-    Tool { caller: Caller, scopes: Vec<String> },
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum VerificationError {
@@ -146,61 +111,13 @@ impl AuthConfig {
         Self::new(&std::env::var(SECRET_ENV).unwrap_or_default())
     }
 
-    fn decoding_key(&self) -> DecodingKey {
-        DecodingKey::from_secret(self.secret.as_bytes())
-    }
-
     /// Validate a platform token. `Validation::default()` pins HS256 and
     /// requires `exp`, so another algorithm, `alg: none`, an expired token and
     /// a wrong secret all fail here.
     pub fn verify_platform(&self, token: &str) -> Option<Caller> {
-        match self.decode_caller(token).ok()? {
-            VerifiedCaller::Platform(caller) => Some(caller),
-            VerifiedCaller::Tool { .. } => None,
-        }
-    }
-
-    fn decode_caller(&self, token: &str) -> Result<VerifiedCaller, VerificationError> {
-        let claims = decode::<TokenClaims>(token, &self.decoding_key(), &Validation::default())
-            .map_err(|_| VerificationError::Invalid)?
-            .claims;
-        if claims.sub.is_empty() || claims.agora_use.is_some() || claims.geolang_use.is_some() {
-            return Err(VerificationError::Invalid);
-        }
-        let name = claims
-            .name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| claims.sub.clone());
-        let caller = Caller {
-            user_id: claims.sub,
-            name,
-            platform_token: None,
-        };
-        match claims.token_use.as_deref() {
-            None => Ok(VerifiedCaller::Platform(Caller {
-                platform_token: Some(PlatformToken(Arc::from(token))),
-                ..caller
-            })),
-            Some(TOOL_TOKEN_USE) => {
-                if claims.role.is_some() {
-                    return Err(VerificationError::Invalid);
-                }
-                let scopes = claims
-                    .scope
-                    .and_then(|scope| scope.as_array().cloned())
-                    .ok_or(VerificationError::Invalid)?
-                    .into_iter()
-                    .map(|scope| {
-                        scope
-                            .as_str()
-                            .map(str::to_owned)
-                            .ok_or(VerificationError::Invalid)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(VerifiedCaller::Tool { caller, scopes })
-            }
-            Some(_) => Err(VerificationError::Invalid),
-        }
+        let verified = verify_token(token, &self.secret).ok()?;
+        matches!(verified.authority, TokenAuthority::Platform { .. })
+            .then(|| verified_caller(verified, token))
     }
 
     pub(crate) fn verify_for_scope(
@@ -208,14 +125,12 @@ impl AuthConfig {
         token: &str,
         required_scope: &str,
     ) -> Result<Caller, VerificationError> {
-        match self.decode_caller(token)? {
-            VerifiedCaller::Platform(caller) => Ok(caller),
-            VerifiedCaller::Tool { caller, scopes } => scopes
-                .iter()
-                .any(|scope| scope == required_scope)
-                .then_some(caller)
-                .ok_or(VerificationError::MissingScope),
+        let verified = verify_token(token, &self.secret)
+            .map_err(|_: InvalidToken| VerificationError::Invalid)?;
+        if !verified.allows_scope(required_scope) {
+            return Err(VerificationError::MissingScope);
         }
+        Ok(verified_caller(verified, token))
     }
 
     /// Validate a share link session token. `aud` is required here, so a
@@ -224,7 +139,8 @@ impl AuthConfig {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_audience(&[SESSION_AUDIENCE]);
         validation.required_spec_claims = ["exp", "aud"].into_iter().map(str::to_string).collect();
-        let claims = decode::<SessionClaims>(token, &self.decoding_key(), &validation)
+        let key = DecodingKey::from_secret(self.secret.as_bytes());
+        let claims = decode::<SessionClaims>(token, &key, &validation)
             .ok()?
             .claims;
         (!claims.sub.is_empty() && !claims.link.is_empty()).then_some(claims)
@@ -273,9 +189,7 @@ impl AuthConfig {
     /// come from `Validation::default()`, the same as a platform token. Whether
     /// the feed still exists is a row lookup the caller makes after this.
     pub fn verify_feed(&self, token: &str) -> Option<FeedClaims> {
-        let claims = decode::<FeedClaims>(token, &self.decoding_key(), &Validation::default())
-            .ok()?
-            .claims;
+        let claims = decode_token::<FeedClaims>(token, &self.secret).ok()?;
         (claims.agora_use == FEED_TOKEN_USE).then_some(claims)
     }
 
@@ -283,6 +197,20 @@ impl AuthConfig {
         let key = EncodingKey::from_secret(self.secret.as_bytes());
         encode(&Header::new(Algorithm::HS256), claims, &key)
             .map_err(|_| ApiError::internal(failure))
+    }
+}
+
+fn verified_caller(verified: VerifiedToken, token: &str) -> Caller {
+    let name = verified
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| verified.sub.clone());
+    let platform_token = matches!(verified.authority, TokenAuthority::Platform { .. })
+        .then(|| PlatformToken(Arc::from(token)));
+    Caller {
+        user_id: verified.sub,
+        name,
+        platform_token,
     }
 }
 
@@ -337,30 +265,6 @@ impl std::fmt::Debug for PlatformToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PlatformToken(redacted)")
     }
-}
-
-pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|token| !token.is_empty())
-}
-
-/// Subprotocol name marking a websocket handshake as carrying a bearer token,
-/// the same marker tiletopia uses.
-pub const BEARER_SUBPROTOCOL: &str = "bearer";
-
-/// Token out of a `Sec-WebSocket-Protocol: bearer, <jwt>` offer. The order is
-/// fixed, marker first and token second, which is what
-/// `new WebSocket(url, ["bearer", jwt])` sends.
-fn subprotocol_token(headers: &HeaderMap) -> Option<&str> {
-    let offered = headers.get(header::SEC_WEBSOCKET_PROTOCOL)?.to_str().ok()?;
-    let mut entries = offered.split(',').map(str::trim);
-    if entries.next()? != BEARER_SUBPROTOCOL {
-        return None;
-    }
-    entries.next().filter(|token| !token.is_empty())
 }
 
 /// The credential on a websocket handshake, in preference order: the
@@ -420,6 +324,7 @@ mod tests {
 
     use super::*;
     use crate::limits::{ATTACHMENT_TOKEN_BYTES, SHARE_TOKEN_BYTES};
+    use axum::http::header;
     use serde_json::json;
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
@@ -828,18 +733,6 @@ mod tests {
             capability_token_hash(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-    }
-
-    #[test]
-    fn bearer_extraction_needs_the_exact_scheme() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(bearer_token(&headers), None);
-        headers.insert(header::AUTHORIZATION, "Bearer abc".parse().unwrap());
-        assert_eq!(bearer_token(&headers), Some("abc"));
-        headers.insert(header::AUTHORIZATION, "bearer abc".parse().unwrap());
-        assert_eq!(bearer_token(&headers), None);
-        headers.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
-        assert_eq!(bearer_token(&headers), None);
     }
 
     fn subprotocol(value: &str) -> HeaderMap {
